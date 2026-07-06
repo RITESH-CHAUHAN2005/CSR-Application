@@ -1,0 +1,4 @@
+<resources>
+    <!-- app_name is provided per build type in app/build.gradle (resValue):
+         "CSR Mini" for release, "CSR Mini Dev" for debug. -->
+</resources>
