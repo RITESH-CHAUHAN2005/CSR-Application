@@ -1,9 +1,7 @@
-// Login gate — shown every time the app opens. For now this is a simple
-// hardcoded admin sign-in (no backend yet). Once PostgreSQL + Node API land,
-// the credential check here gets swapped for a real auth call; the rest of the
-// screen stays the same. On success it calls onLogin() and the app reveals its
-// pages.
-import React, { useState } from 'react';
+// Login gate — shown every time the app opens. Credentials are checked via
+// the `authenticate` prop, which calls the live backend API. On success it
+// calls onLogin() and the app reveals its pages.
+import React, { useRef, useState } from 'react';
 import {
   Image, KeyboardAvoidingView, Platform, Pressable, ScrollView,
   StyleSheet, Text, TextInput, View,
@@ -15,9 +13,9 @@ import { Eye } from 'phosphor-react-native/src/icons/Eye';
 import { EyeSlash } from 'phosphor-react-native/src/icons/EyeSlash';
 import { theme } from '../theme';
 
-// `authenticate` checks the credentials against the in-memory user store (and,
-// later, the DB-backed API). It returns an error string to show, or null on
-// success — at which point AuthGate swaps this screen for the app.
+// `authenticate` checks the credentials against the DB-backed API. It returns
+// an error string to show, or null on success — at which point AuthGate swaps
+// this screen for the app.
 export default function Login({ authenticate }: { authenticate: (email: string, password: string) => Promise<string | null> }) {
   const insets = useSafeAreaInsets();
   const [email, setEmail] = useState('');
@@ -25,10 +23,11 @@ export default function Login({ authenticate }: { authenticate: (email: string, 
   const [show, setShow] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const passwordRef = useRef<TextInput>(null);
 
   const submit = async () => {
     if (busy) return;
-    if (!email.trim() || !password) { setError('Please enter your email and password.'); return; }
+    if (!email.trim() || !password.trim()) { setError('Please enter your email and password.'); return; }
     setBusy(true);
     const err = await authenticate(email, password);
     setBusy(false);
@@ -65,6 +64,7 @@ export default function Login({ authenticate }: { authenticate: (email: string, 
                 autoCorrect={false}
                 style={styles.input}
                 returnKeyType="next"
+                onSubmitEditing={() => passwordRef.current?.focus()}
               />
             </View>
 
@@ -72,6 +72,7 @@ export default function Login({ authenticate }: { authenticate: (email: string, 
             <View style={[styles.inputRow, !!error && styles.inputRowError]}>
               <Lock size={18} color={theme.faint} weight="bold" />
               <TextInput
+                ref={passwordRef}
                 value={password}
                 onChangeText={t => { setPassword(t); if (error) setError(''); }}
                 placeholder="••••••••"

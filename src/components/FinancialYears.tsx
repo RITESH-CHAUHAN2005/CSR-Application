@@ -2,7 +2,7 @@
 // (with themed date pickers), delete. Each year toggles independently — any
 // number of years can be active at the same time.
 import React, { useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { CalendarBlank } from 'phosphor-react-native/src/icons/CalendarBlank';
 import { PencilSimple } from 'phosphor-react-native/src/icons/PencilSimple';
 import { Trash } from 'phosphor-react-native/src/icons/Trash';
@@ -15,8 +15,11 @@ import {
 
 type Props = {
   years: FinancialYear[];
-  add: (y: Omit<FinancialYear, 'id'>) => void;
-  update: (id: string, y: Omit<FinancialYear, 'id'>) => void;
+  // add/update resolve to false when the write was blocked or failed (e.g.
+  // network error), so save() can keep the form open with what the user
+  // typed instead of discarding it.
+  add: (y: Omit<FinancialYear, 'id'>) => void | Promise<boolean>;
+  update: (id: string, y: Omit<FinancialYear, 'id'>) => void | Promise<boolean>;
   setActive: (id: string, active: boolean) => void;
   remove: (id: string) => void;
 };
@@ -38,11 +41,17 @@ export default function FinancialYears({ years, add, update, setActive, remove }
     setForm({ name: y.name, start: y.start, end: y.end, active: y.active });
     setShowForm(true);
   };
-  const save = () => {
-    if (!form.name.trim()) return;
+  const save = async () => {
+    if (!form.name.trim()) {
+      Alert.alert('Missing details', 'Financial Year name is required.');
+      return;
+    }
     const payload = { name: form.name.trim(), start: form.start.trim(), end: form.end.trim(), active: form.active };
-    if (editing) update(editing.id, payload); else add(payload);
-    setShowForm(false);
+    // Wait for the write to actually succeed before closing the modal - on
+    // failure (network error, server rejection) keep it open with the
+    // entered values so the user can retry without retyping everything.
+    const ok = await (editing ? update(editing.id, payload) : add(payload));
+    if (ok !== false) setShowForm(false);
   };
 
   return (

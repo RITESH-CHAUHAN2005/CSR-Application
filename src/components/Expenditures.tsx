@@ -7,7 +7,7 @@ import { MagnifyingGlass } from 'phosphor-react-native/src/icons/MagnifyingGlass
 import { PencilSimple } from 'phosphor-react-native/src/icons/PencilSimple';
 import { Trash } from 'phosphor-react-native/src/icons/Trash';
 import { HandCoins } from 'phosphor-react-native/src/icons/HandCoins';
-import { Lock } from 'phosphor-react-native/src/icons/Lock';
+import { Buildings } from 'phosphor-react-native/src/icons/Buildings';
 import { theme } from '../theme';
 import {
   AddPill,
@@ -24,6 +24,7 @@ import {
   InfoButton,
   InfoModal,
   Input,
+  MasterDataItem,
   Modal,
   Pill,
   Project,
@@ -38,6 +39,7 @@ type Props = {
   projects: Project[];
   companies: Company[];
   years: FinancialYear[];
+  masterData: MasterDataItem[];
   add: (e: Omit<Expenditure, 'id'>) => void;
   update: (id: string, e: Omit<Expenditure, 'id'>) => void;
   remove: (id: string) => void;
@@ -48,6 +50,7 @@ const blank = {
   companyId: '',
   yearId: '',
   amount: '',
+  carryForwardAmount: '',
   date: '',
   category: '',
   approvedBy: '',
@@ -61,6 +64,7 @@ export default function Expenditures({
   projects,
   companies,
   years,
+  masterData,
   add,
   update,
   remove,
@@ -85,8 +89,8 @@ export default function Expenditures({
   const yearName = (id: string) => years.find(y => y.id === id)?.name ?? '—';
 
   // Record form's Financial Year dropdown only offers ACTIVE years (current
-  // value kept when editing, or when auto-filled from a project on an
-  // inactive year).
+  // value kept when editing a record whose year has since gone inactive, so old
+  // data isn't corrupted).
   const activeYears = years.filter(y => y.active);
   const formYearOpts = (currentId: string) => {
     const opts = activeYears.map(y => ({ label: y.name, value: y.id }));
@@ -97,15 +101,33 @@ export default function Expenditures({
     return opts;
   };
 
-  // Picking a project auto-fills the company + financial year it belongs to.
+  // Category dropdown draws from Master Data ('category' values). If the list is
+  // empty we fall back to a plain text Input so data entry is never blocked.
+  const categoryOpts = masterData
+    .filter(m => m.type === 'category')
+    .map(m => ({ label: m.value, value: m.value }));
+
+  // The picked project drives the Company dropdown (only its funding companies)
+  // and whether the Carry Forward field is shown (Ongoing projects only). There
+  // is no financial year on a project anymore, so the FY stays user-chosen.
+  const selectedProject = projects.find(p => p.id === form.projectId) ?? null;
+  const formCompanyOpts = selectedProject
+    ? companies
+        .filter(c => selectedProject.companyIds.includes(c.id))
+        .map(c => ({ label: c.name, value: c.id }))
+    : [];
+  const isOngoing = selectedProject?.derivedStatus === 'ongoing';
+  const contributingNames = selectedProject
+    ? selectedProject.companyIds.map(id => companyName(id))
+    : [];
+
+  // Picking a project limits the Company dropdown to that project's companies;
+  // if the project has exactly one company, auto-select it. The previously
+  // chosen company is cleared because it may not fund the new project.
   const pickProject = (projectId: string) => {
     const p = projects.find(x => x.id === projectId);
-    setForm(f => ({
-      ...f,
-      projectId,
-      companyId: p?.companyId ?? f.companyId,
-      yearId: p?.yearId ?? f.yearId,
-    }));
+    const only = p && p.companyIds.length === 1 ? p.companyIds[0] : '';
+    setForm(f => ({ ...f, projectId, companyId: only }));
   };
 
   const filtered = useMemo(() => {
@@ -134,12 +156,8 @@ export default function Expenditures({
   const openAdd = () => {
     setEditing(null);
     const p = projects[0];
-    setForm({
-      ...blank,
-      projectId: p?.id ?? '',
-      companyId: p?.companyId ?? '',
-      yearId: p?.yearId ?? '',
-    });
+    const only = p && p.companyIds.length === 1 ? p.companyIds[0] : '';
+    setForm({ ...blank, projectId: p?.id ?? '', companyId: only });
     setShowForm(true);
   };
   const openEdit = (e: Expenditure) => {
@@ -149,6 +167,7 @@ export default function Expenditures({
       companyId: e.companyId,
       yearId: e.yearId,
       amount: String(e.amount),
+      carryForwardAmount: e.carryForwardAmount ? String(e.carryForwardAmount) : '',
       date: e.date,
       category: e.category,
       approvedBy: e.approvedBy,
@@ -176,6 +195,9 @@ export default function Expenditures({
       category: form.category.trim(),
       approvedBy: form.approvedBy.trim(),
       amount: Number(form.amount) || 0,
+      // Carry Forward is only meaningful (and only collected) for Ongoing
+      // projects — forced to 0 otherwise, always sent.
+      carryForwardAmount: isOngoing ? Number(form.carryForwardAmount) || 0 : 0,
       description: form.description.trim(),
       reference: form.reference.trim(),
       notes: form.notes.trim(),
@@ -319,19 +341,33 @@ export default function Expenditures({
             placeholder="Select project"
           />
         </Field>
-        <View style={styles.formRow}>
-          <View style={{ flex: 1 }}>
-            <Field label="Company">
-              <View style={styles.lockedField}>
-                <Lock size={14} color={theme.faint} weight="bold" />
-                <Text style={styles.lockedText} numberOfLines={1}>
-                  {form.companyId
-                    ? companyName(form.companyId)
-                    : 'Select a project first'}
-                </Text>
-              </View>
-            </Field>
+        <Field label="Company *">
+          <Select
+            value={form.companyId}
+            options={formCompanyOpts}
+            onChange={v => set('companyId', v)}
+            placeholder={
+              form.projectId ? 'Select company' : 'Select a project first'
+            }
+          />
+        </Field>
+
+        {/* Read-only panel: who has funded the selected project so far. */}
+        <View style={styles.contribBox}>
+          <View style={styles.contribHead}>
+            <Buildings size={14} color={theme.primary} weight="bold" />
+            <Text style={styles.contribTitle}>Contributing Companies</Text>
           </View>
+          {contributingNames.length > 0 ? (
+            <Text style={styles.contribNames}>
+              {contributingNames.join(' · ')}
+            </Text>
+          ) : (
+            <Text style={styles.contribEmpty}>Select a project first</Text>
+          )}
+        </View>
+
+        <View style={styles.formRow}>
           <View style={{ flex: 1 }}>
             <Field label="Financial Year *">
               <Select
@@ -339,18 +375,6 @@ export default function Expenditures({
                 options={formYearOpts(form.yearId)}
                 onChange={v => set('yearId', v)}
                 placeholder="Select year"
-              />
-            </Field>
-          </View>
-        </View>
-        <View style={styles.formRow}>
-          <View style={{ flex: 1 }}>
-            <Field label="Amount (₹) *">
-              <Input
-                value={form.amount}
-                onChangeText={t => set('amount', t)}
-                placeholder="0"
-                keyboardType="numeric"
               />
             </Field>
           </View>
@@ -366,12 +390,46 @@ export default function Expenditures({
         </View>
         <View style={styles.formRow}>
           <View style={{ flex: 1 }}>
-            <Field label="Category">
+            <Field label="Amount (₹) *">
               <Input
-                value={form.category}
-                onChangeText={t => set('category', t)}
-                placeholder="e.g. Training, Deepanshu"
+                value={form.amount}
+                onChangeText={t => set('amount', t)}
+                placeholder="0"
+                keyboardType="numeric"
               />
+            </Field>
+          </View>
+          {/* Carry Forward only applies to Ongoing projects (0 otherwise). */}
+          {isOngoing && (
+            <View style={{ flex: 1 }}>
+              <Field label="Carry Forward Amount (₹)">
+                <Input
+                  value={form.carryForwardAmount}
+                  onChangeText={t => set('carryForwardAmount', t)}
+                  placeholder="0"
+                  keyboardType="numeric"
+                />
+              </Field>
+            </View>
+          )}
+        </View>
+        <View style={styles.formRow}>
+          <View style={{ flex: 1 }}>
+            <Field label="Category">
+              {categoryOpts.length > 0 ? (
+                <Select
+                  value={form.category}
+                  options={categoryOpts}
+                  onChange={v => set('category', v)}
+                  placeholder="Select category"
+                />
+              ) : (
+                <Input
+                  value={form.category}
+                  onChangeText={t => set('category', t)}
+                  placeholder="e.g. Training, Equipment"
+                />
+              )}
             </Field>
           </View>
           <View style={{ flex: 1 }}>
@@ -427,7 +485,8 @@ export default function Expenditures({
       />
 
       {/* Read-only details popup — available to every role (viewers included).
-          Includes the Financial Year so a multi-year project's spend is clear. */}
+          Includes the Financial Year so a multi-year project's spend is clear,
+          and the Carry Forward only when it's actually set. */}
       <InfoModal
         visible={!!info}
         title={info ? projectName(info.projectId) : 'Expenditure'}
@@ -437,6 +496,9 @@ export default function Expenditures({
           { label: 'Financial Year', value: yearName(info.yearId) },
           { label: 'Company', value: companyName(info.companyId) },
           { label: 'Amount', value: inr(info.amount) },
+          ...(info.carryForwardAmount > 0
+            ? [{ label: 'Carry Forward', value: inr(info.carryForwardAmount) }]
+            : []),
           { label: 'Category', value: info.category || '—' },
           { label: 'Approved By', value: info.approvedBy || '—' },
           { label: 'Reference', value: info.reference || '—' },
@@ -529,18 +591,36 @@ const styles = StyleSheet.create({
   },
 
   formRow: { flexDirection: 'row', gap: 10 },
-  lockedField: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 7,
-    backgroundColor: '#f1f2f9',
+  // Soft info box listing the selected project's funding companies.
+  contribBox: {
+    backgroundColor: theme.primarySoft,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: theme.border,
-    paddingHorizontal: 13,
-    minHeight: 48,
+    padding: 12,
+    marginBottom: 14,
   },
-  lockedText: { flex: 1, fontSize: 14, color: theme.muted, fontWeight: '600' },
+  contribHead: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  contribTitle: {
+    fontSize: 10,
+    color: theme.primary,
+    fontWeight: '700',
+    letterSpacing: 0.5,
+    textTransform: 'uppercase',
+  },
+  contribNames: {
+    fontSize: 13,
+    color: theme.text,
+    fontWeight: '600',
+    marginTop: 6,
+    lineHeight: 19,
+  },
+  contribEmpty: {
+    fontSize: 13,
+    color: theme.faint,
+    fontStyle: 'italic',
+    marginTop: 6,
+  },
   actions: {
     flexDirection: 'row',
     justifyContent: 'flex-end',

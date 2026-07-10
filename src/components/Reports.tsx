@@ -1,8 +1,10 @@
-// Screen 7 — Financial Reports. Mirrors the web app's /reports page with three
-// summary views, switched by a segmented control:
+// Screen 7 — Financial Reports. Mirrors the web app's /reports page with five
+// summary views, switched by a horizontally-scrollable tab bar:
+//   • Transaction Ledger    → every receipt & expenditure with a running balance
 //   • Year-wise Summary     → fund flow per financial year (bar chart + table)
 //   • Company-wise Summary  → fund position per company   (bar chart + table)
-//   • Project-wise Summary  → budget vs spend per project (table only)
+//   • Project-wise Summary  → budget vs spend per project (bar + status pie + table)
+//   • Carry Forward         → per-company carry-forward share of ongoing projects
 //
 // Built with the requested RN libraries, but tuned to feel native:
 //   • react-native-gifted-charts   → grouped bar charts
@@ -11,7 +13,7 @@
 //   • the app's own <Select>       → the Company / Year filters, so the dropdown
 //                                     opens as a sheet exactly like every other page
 // Colours come from the existing app theme.
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { Dimensions, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { BarChart, PieChart } from 'react-native-gifted-charts';
 import { DataTable, MD3LightTheme, Provider as PaperProvider } from 'react-native-paper';
@@ -20,8 +22,8 @@ import Share from 'react-native-share';
 import { Export } from 'phosphor-react-native/src/icons/Export';
 import { theme } from '../theme';
 import {
-  Card, Company, DatePicker, EmptyState, Expenditure, FinancialYear, FundReceipt, Project,
-  Header, Pill, Select, projectStatusLabel, projectStatusTone, inr, inrShort,
+  Card, Company, DatePicker, EmptyState, Expenditure, FinancialYear, FundReceipt, Project, ProjectStatus,
+  Header, Pill, Select, projectStatusLabel, projectStatusTone, inr, inrShort, fmtNice, fmtDateTime,
 } from '../../App';
 
 type Props = {
@@ -32,7 +34,7 @@ type Props = {
   expenditures: Expenditure[];
 };
 
-type TabKey = 'year' | 'company' | 'project';
+type TabKey = 'ledger' | 'year' | 'company' | 'project' | 'carry';
 const SCREEN_W = Dimensions.get('window').width;
 
 // Paper's DataTable reads colours from its theme context — align them with ours.
@@ -59,22 +61,68 @@ const C_BALANCE = theme.success;  // green
 const PIE_COLORS = [theme.primary, theme.accent, theme.violet, theme.amber, theme.success, theme.danger];
 
 export default function Reports({ companies, years, projects, receipts, expenditures }: Props) {
-  const [tab, setTab] = useState<TabKey>('year');
+  const [tab, setTab] = useState<TabKey>('ledger');
   const [companyFilter, setCompanyFilter] = useState('all');
   const [yearFilter, setYearFilter] = useState('all');
   // Optional date-range filter (themed flatpickr-style picker, ISO YYYY-MM-DD).
   const [fromDate, setFromDate] = useState('');
   const [toDate, setToDate] = useState('');
 
-  const inYear = (yid: string) => yearFilter === 'all' || yid === yearFilter;
-  const inCo = (cid: string) => companyFilter === 'all' || cid === companyFilter;
+  const inYear = useCallback((yid: string) => yearFilter === 'all' || yid === yearFilter, [yearFilter]);
+  const inCo = useCallback((cid: string) => companyFilter === 'all' || cid === companyFilter, [companyFilter]);
+  // A project may fund from several companies now — it passes the company filter
+  // when ANY of its companyIds match the selection.
+  const projInCo = useCallback((p: Project) => companyFilter === 'all' || p.companyIds.includes(companyFilter), [companyFilter]);
   // ISO date strings sort lexicographically, so plain string compare is enough.
-  const inDate = (d: string) => (!fromDate || d >= fromDate) && (!toDate || d <= toDate);
-  const companyName = (id: string) => companies.find(c => c.id === id)?.name || '—';
-  const yearName = (id: string) => years.find(y => y.id === id)?.name || '—';
+  const inDate = useCallback((d: string) => (!fromDate || d >= fromDate) && (!toDate || d <= toDate), [fromDate, toDate]);
+  const companyName = useCallback((id: string) => companies.find(c => c.id === id)?.name || '—', [companies]);
+  const yearName = useCallback((id: string) => years.find(y => y.id === id)?.name || '—', [years]);
+  const projectName = useCallback((id: string) => projects.find(p => p.id === id)?.name || '—', [projects]);
+  // "Rolls Into" — the next financial year whose start falls after a project's end
+  // date; falls back to a generic label when no later FY exists / no end date.
+  const rollsInto = useCallback((endDate: string) => {
+    if (!endDate) return 'Next FY';
+    const next = years
+      .filter(y => y.start && y.start > endDate)
+      .sort((a, b) => (a.start < b.start ? -1 : 1))[0];
+    return next ? next.name : 'Next FY';
+  }, [years]);
 
   const companyOpts = [{ label: 'All Companies', value: 'all' }, ...companies.map(c => ({ label: c.name, value: c.id }))];
   const yearOpts = [{ label: 'All Years', value: 'all' }, ...years.map(y => ({ label: y.name, value: y.id }))];
+
+  // ── Transaction Ledger rows ──
+  // Merge receipts (+amount) and expenditures (−amount) that pass the filters,
+  // sort by date ascending, then accumulate a running Total Balance.
+  type LedgerRow = {
+    id: string; type: 'Receipt' | 'Expenditure'; date: string;
+    companyId: string; projectId: string; yearId: string;
+    base: number; carry: number; balance: number;
+  };
+  const ledgerRows = useMemo<LedgerRow[]>(() => {
+    const rx = receipts
+      .filter(r => inCo(r.companyId) && inYear(r.yearId) && inDate(r.date))
+      .map(r => ({
+        id: 'r' + r.id, type: 'Receipt' as const, date: r.date, companyId: r.companyId,
+        projectId: r.projectId, yearId: r.yearId, base: r.amount, carry: r.carryForward, signed: r.amount,
+      }));
+    const ex = expenditures
+      .filter(e => inCo(e.companyId) && inYear(e.yearId) && inDate(e.date))
+      .map(e => ({
+        id: 'e' + e.id, type: 'Expenditure' as const, date: e.date, companyId: e.companyId,
+        projectId: e.projectId, yearId: e.yearId, base: e.amount, carry: e.carryForwardAmount, signed: -e.amount,
+      }));
+    const all = [...rx, ...ex].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+    let running = 0;
+    return all.map(x => {
+      running += x.signed;
+      return { id: x.id, type: x.type, date: x.date, companyId: x.companyId, projectId: x.projectId, yearId: x.yearId, base: x.base, carry: x.carry, balance: running };
+    });
+  }, [receipts, expenditures, inCo, inYear, inDate]);
+
+  const ledgerIn = useMemo(() => sum(ledgerRows.filter(x => x.type === 'Receipt').map(x => x.base)), [ledgerRows]);
+  const ledgerOut = useMemo(() => sum(ledgerRows.filter(x => x.type === 'Expenditure').map(x => x.base)), [ledgerRows]);
+  const ledgerFinal = ledgerRows.length ? ledgerRows[ledgerRows.length - 1].balance : 0;
 
   // ── Year-wise rows ──
   const yearRows = useMemo(() => {
@@ -87,7 +135,7 @@ export default function Reports({ companies, years, projects, receipts, expendit
       const balance = available - spent;
       return { id: y.id, name: y.name, received, carryIn, available, spent, balance, carryOut: balance };
     });
-  }, [years, receipts, expenditures, yearFilter, companyFilter, fromDate, toDate]);
+  }, [years, receipts, expenditures, yearFilter, inCo, inDate]);
 
   const yearTotals = useMemo(() => ({
     received: sum(yearRows.map(r => r.received)),
@@ -106,10 +154,11 @@ export default function Reports({ companies, years, projects, receipts, expendit
       const carry = sum(receipts.filter(r => r.companyId === c.id && inYear(r.yearId) && inDate(r.date)).map(r => r.carryForward));
       const spent = sum(expenditures.filter(e => e.companyId === c.id && inYear(e.yearId) && inDate(e.date)).map(e => e.amount));
       const balance = received + carry - spent;
-      const projCount = projects.filter(p => p.companyId === c.id && inYear(p.yearId)).length;
+      // A project counts for this company when it lists the company among its funders.
+      const projCount = projects.filter(p => p.companyIds.includes(c.id)).length;
       return { id: c.id, name: c.name, received, carry, spent, balance, projCount };
     });
-  }, [companies, projects, receipts, expenditures, yearFilter, companyFilter, fromDate, toDate]);
+  }, [companies, projects, receipts, expenditures, companyFilter, inYear, inDate]);
 
   const companyTotals = useMemo(() => ({
     received: sum(companyRows.map(r => r.received)),
@@ -120,42 +169,85 @@ export default function Reports({ companies, years, projects, receipts, expendit
   }), [companyRows]);
 
   // ── Project-wise rows ──
+  // Projects no longer carry a financial year; "Received" is what the project's
+  // companies actually paid to it (company receipts only, never other_source).
   const projectRows = useMemo(() => {
     return projects
-      .filter(p => inCo(p.companyId) && inYear(p.yearId))
+      .filter(p => projInCo(p))
       .map(p => {
-        const spent = sum(expenditures.filter(e => e.projectId === p.id && inDate(e.date)).map(e => e.amount));
-        const balance = p.budget - spent;
+        const received = sum(receipts.filter(r => r.projectId === p.id && r.receiptType === 'company' && inCo(r.companyId) && inYear(r.yearId) && inDate(r.date)).map(r => r.amount));
+        const spent = sum(expenditures.filter(e => e.projectId === p.id && inYear(e.yearId) && inCo(e.companyId) && inDate(e.date)).map(e => e.amount));
         const util = p.budget > 0 ? (spent / p.budget) * 100 : 0;
-        return { id: p.id, name: p.name, company: companyName(p.companyId), year: yearName(p.yearId), status: p.status, budget: p.budget, spent, balance, util };
+        const company = p.companyIds.map(companyName).join(', ') || '—';
+        const period = `${fmtNice(p.startDate)} → ${p.endDate ? fmtNice(p.endDate) : (p.derivedStatus === 'ongoing' ? 'Ongoing' : '—')}`;
+        return { id: p.id, name: p.name, company, period, status: p.status, budget: p.budget, received, spent, util };
       });
-  }, [projects, expenditures, yearFilter, companyFilter, fromDate, toDate]);
+  }, [projects, receipts, expenditures, projInCo, inCo, inYear, inDate, companyName]);
 
   const projectTotals = useMemo(() => ({
     budget: sum(projectRows.map(r => r.budget)),
+    received: sum(projectRows.map(r => r.received)),
     spent: sum(projectRows.map(r => r.spent)),
-    balance: sum(projectRows.map(r => r.balance)),
   }), [projectRows]);
+
+  // ── Carry Forward rows ──
+  // One row per (ongoing project, contributing company). The project's total
+  // carry-forward is split across its companies in proportion to what each
+  // actually paid into that project (company receipts only).
+  const carryRows = useMemo(() => {
+    const rows: { key: string; project: string; company: string; contribPct: number; share: number; rollsInto: string }[] = [];
+    projects
+      .filter(p => p.derivedStatus === 'ongoing' && projInCo(p))
+      .forEach(p => {
+        const totalCF = sum(expenditures.filter(e => e.projectId === p.id && inYear(e.yearId) && inDate(e.date)).map(e => e.carryForwardAmount));
+        if (totalCF <= 0) return;
+        const paid = p.companyIds.map(cid => ({
+          cid,
+          amount: sum(receipts.filter(r => r.projectId === p.id && r.companyId === cid && r.receiptType === 'company' && inYear(r.yearId) && inDate(r.date)).map(r => r.amount)),
+        }));
+        const totalPaid = sum(paid.map(x => x.amount));
+        const label = rollsInto(p.endDate);
+        paid.forEach(x => {
+          if (companyFilter !== 'all' && x.cid !== companyFilter) return; // narrow to the filtered company
+          const pct = totalPaid > 0 ? (x.amount / totalPaid) * 100 : 0;
+          const share = totalPaid > 0 ? totalCF * (x.amount / totalPaid) : 0;
+          rows.push({ key: p.id + '_' + x.cid, project: p.name, company: companyName(x.cid), contribPct: pct, share, rollsInto: label });
+        });
+      });
+    return rows;
+  }, [projects, expenditures, receipts, projInCo, companyFilter, inYear, inDate, companyName, rollsInto]);
+
+  const carryTotals = useMemo(() => ({ share: sum(carryRows.map(r => r.share)) }), [carryRows]);
 
   // ── Grouped bar chart data ──
   const buildGrouped = (groups: { label: string; bars: { value: number; color: string }[] }[]) => {
     const out: any[] = [];
     groups.forEach(g => {
+      // Centre the group label under its middle bar, whatever the bar count
+      // (index 1 of 3 for year/company charts, index 0 of 2 for the project chart).
+      const mid = Math.floor((g.bars.length - 1) / 2);
       g.bars.forEach((b, i) => {
         const last = i === g.bars.length - 1;
         out.push({
           value: Math.max(0, b.value),
           frontColor: b.color,
           spacing: last ? 22 : 3,
-          // Centre the year/company label under the middle bar of the group.
-          label: i === 1 ? shortYear(g.label) : undefined,
-          labelWidth: i === 1 ? 64 : undefined,
-          labelTextStyle: i === 1 ? styles.barLabel : undefined,
+          label: i === mid ? shortYear(g.label) : undefined,
+          labelWidth: i === mid ? 64 : undefined,
+          labelTextStyle: i === mid ? styles.barLabel : undefined,
         });
       });
     });
     return out;
   };
+
+  // Ledger: a simple two-bar "money in vs money out" summary.
+  const ledgerChart = useMemo(() => [
+    { value: Math.max(0, ledgerIn), frontColor: C_RECEIVED, label: 'Money In', labelWidth: 80, labelTextStyle: styles.barLabel, spacing: 40 },
+    { value: Math.max(0, ledgerOut), frontColor: C_SPENT, label: 'Money Out', labelWidth: 80, labelTextStyle: styles.barLabel },
+  ], [ledgerIn, ledgerOut]);
+  const ledgerMax = niceMax(Math.max(1, ledgerIn, ledgerOut));
+  const ledgerYLabels = Array.from({ length: 5 }, (_, i) => inrShort((ledgerMax * i) / 4));
 
   const yearChart = useMemo(() => buildGrouped(yearRows.map(r => ({
     label: r.name,
@@ -175,17 +267,20 @@ export default function Reports({ companies, years, projects, receipts, expendit
     ],
   }))), [companyRows]);
 
-  const projectChart = useMemo(() => buildGrouped(projectRows.map(r => ({
+  // Budget-vs-Spent bar — top 10 projects by budget, so the chart stays readable.
+  const projectChartRows = useMemo(() => [...projectRows].sort((a, b) => b.budget - a.budget).slice(0, 10), [projectRows]);
+  const projectChart = useMemo(() => buildGrouped(projectChartRows.map(r => ({
     label: r.name,
     bars: [
       { value: r.budget, color: C_RECEIVED },
       { value: r.spent, color: C_SPENT },
-      { value: Math.max(0, r.balance), color: C_BALANCE },
     ],
-  }))), [projectRows]);
+  }))), [projectChartRows]);
   // Each group is 3 bars (14 wide + 3/3/22 spacing) ≈ 70px — scroll horizontally once
-  // there are more projects than fit on screen, instead of squeezing every bar.
-  const projectChartWidth = Math.max(SCREEN_W - 96, projectRows.length * 70 + 14);
+  // there are more projects/years/companies than fit on screen, instead of squeezing every bar.
+  const projectChartWidth = Math.max(SCREEN_W - 96, projectChartRows.length * 70 + 14);
+  const yearChartWidth = Math.max(SCREEN_W - 96, yearRows.length * 70 + 14);
+  const companyChartWidth = Math.max(SCREEN_W - 96, companyRows.length * 70 + 14);
 
   const activeChart = tab === 'year' ? yearChart : companyChart;
   const chartMax = niceMax(Math.max(1, ...activeChart.map(d => d.value)));
@@ -201,12 +296,23 @@ export default function Reports({ companies, years, projects, receipts, expendit
     [companyRows]);
   const pieTotal = sum(companyPie.map(s => s.value));
 
-  // ── Donut: share of total approved budget, by project ──
-  const projectPie = useMemo(() => projectRows
-    .filter(r => r.budget > 0)
-    .map((r, i) => ({ value: r.budget, color: PIE_COLORS[i % PIE_COLORS.length], name: r.name })),
-    [projectRows]);
-  const projectPieTotal = sum(projectPie.map(s => s.value));
+  // ── Donut: share of expenditure, by financial year ──
+  const yearPie = useMemo(() => yearRows
+    .filter(r => r.spent > 0)
+    .map((r, i) => ({ value: r.spent, color: PIE_COLORS[i % PIE_COLORS.length], name: r.name })),
+    [yearRows]);
+  const yearPieTotal = sum(yearPie.map(s => s.value));
+
+  // ── Donut: projects grouped by status ──
+  const statusPie = useMemo(() => {
+    const order: ProjectStatus[] = ['active', 'completed', 'on_hold', 'cancelled'];
+    const counts = new Map<ProjectStatus, number>();
+    projectRows.forEach(r => counts.set(r.status, (counts.get(r.status) || 0) + 1));
+    return order
+      .filter(s => (counts.get(s) || 0) > 0)
+      .map((s, i) => ({ value: counts.get(s) as number, color: PIE_COLORS[i % PIE_COLORS.length], name: projectStatusLabel(s) }));
+  }, [projectRows]);
+  const statusPieTotal = sum(statusPie.map(s => s.value));
 
   const escapeHtml = (v: string | number) =>
     String(v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
@@ -220,32 +326,62 @@ export default function Reports({ companies, years, projects, receipts, expendit
     let rows: (string | number)[][] = [];
     let totals: (string | number)[] = [];
     let numericFrom = 1; // column index from which cells are right-aligned numbers
+    // Flagged column indices per row/total — mirrors the on-screen Cell `color`
+    // logic (balance < 0 red, utilization > 90% red), computed from the raw
+    // numeric values (not the formatted strings) so it can't be fooled by "₹-".
+    let rowFlags: number[][] = [];
+    let totalFlags: number[] = [];
 
-    if (tab === 'year') {
+    if (tab === 'ledger') {
+      title = 'Transaction Ledger';
+      headers = ['Type', 'Date', 'Company', 'Project', 'FY', 'Base Amount', 'Carry Forward', 'Total Balance'];
+      rows = ledgerRows.map(x => [x.type, fmtNice(x.date), companyName(x.companyId), projectName(x.projectId), shortYear(yearName(x.yearId)), inr(x.base), inr(x.carry), inr(x.balance)]);
+      totals = ['Total', '', '', '', '', '', '', inr(ledgerFinal)];
+      numericFrom = 5;
+      // Expenditure base amounts (5) shown in red; a negative running balance (7) in red.
+      rowFlags = ledgerRows.map(x => [...(x.type === 'Expenditure' ? [5] : []), ...(x.balance < 0 ? [7] : [])]);
+      totalFlags = ledgerFinal < 0 ? [7] : [];
+    } else if (tab === 'year') {
       title = 'Fund Flow by Financial Year';
       headers = ['Financial Year', 'Received', 'Carry Fwd In', 'Total Available', 'Expenditure', 'Balance', 'Carry Fwd Out'];
       rows = yearRows.map(r => [r.name, inr(r.received), inr(r.carryIn), inr(r.available), inr(r.spent), inr(r.balance), inr(r.carryOut)]);
       totals = ['Total', inr(yearTotals.received), inr(yearTotals.carryIn), inr(yearTotals.available), inr(yearTotals.spent), inr(yearTotals.balance), inr(yearTotals.carryOut)];
+      rowFlags = yearRows.map(r => (r.balance < 0 ? [5] : []));
+      totalFlags = yearTotals.balance < 0 ? [5] : [];
     } else if (tab === 'company') {
       title = 'Fund Position by Company';
       headers = ['Company', 'Received', 'Carry Forward', 'Expenditure', 'Balance', 'Projects'];
       rows = companyRows.map(r => [r.name, inr(r.received), inr(r.carry), inr(r.spent), inr(r.balance), r.projCount]);
       totals = ['Total', inr(companyTotals.received), inr(companyTotals.carry), inr(companyTotals.spent), inr(companyTotals.balance), companyTotals.projCount];
+      rowFlags = companyRows.map(r => (r.balance < 0 ? [4] : []));
+      totalFlags = companyTotals.balance < 0 ? [4] : [];
+    } else if (tab === 'project') {
+      title = 'Project-wise Budget & Utilization';
+      headers = ['Project', 'Company', 'Period', 'Budget', 'Received', 'Spent', 'Utilization', 'Status'];
+      rows = projectRows.map(r => [r.name, r.company, r.period, inr(r.budget), inr(r.received), inr(r.spent), `${r.util.toFixed(1)}%`, projectStatusLabel(r.status)]);
+      totals = ['Total', '', '', inr(projectTotals.budget), inr(projectTotals.received), inr(projectTotals.spent), '', ''];
+      numericFrom = 3;
+      // Utilization column (6) red above 90%.
+      rowFlags = projectRows.map(r => (r.util > 90 ? [6] : []));
+      totalFlags = [];
     } else {
-      title = 'Project-wise Budget & Expenditure';
-      headers = ['Project', 'Company', 'Year', 'Status', 'Approved Budget', 'Expenditure', 'Balance', 'Utilization'];
-      rows = projectRows.map(r => [r.name, r.company, shortYear(r.year), projectStatusLabel(r.status), inr(r.budget), inr(r.spent), inr(r.balance), `${r.util.toFixed(1)}%`]);
-      totals = ['Total', '', '', '', inr(projectTotals.budget), inr(projectTotals.spent), inr(projectTotals.balance), ''];
-      numericFrom = 4;
+      title = 'Carry Forward Distribution (Ongoing Projects)';
+      headers = ['Project', 'Company', 'Contribution %', 'Carry Forward Share', 'Rolls Into'];
+      rows = carryRows.map(r => [r.project, r.company, `${r.contribPct.toFixed(1)}%`, inr(r.share), r.rollsInto]);
+      totals = ['Total', '', '', inr(carryTotals.share), ''];
+      numericFrom = 2;
+      rowFlags = [];
+      totalFlags = [];
     }
 
     const filtersLine =
       `Company: ${companyFilter === 'all' ? 'All Companies' : companyName(companyFilter)}` +
       `  •  Year: ${yearFilter === 'all' ? 'All Years' : yearName(yearFilter)}` +
       (fromDate || toDate ? `  •  ${fromDate || 'Start'} to ${toDate || 'Today'}` : '');
-    const generated = new Date().toISOString().slice(0, 16).replace('T', ' ');
+    const generated = fmtDateTime(new Date().toISOString());
 
-    const cellHtml = (v: string | number, i: number) => `<td class="${i >= numericFrom ? 'num' : ''}">${escapeHtml(v)}</td>`;
+    const cellHtml = (v: string | number, i: number, flagged: number[]) =>
+      `<td class="${i >= numericFrom ? 'num' : ''}${flagged.includes(i) ? ' danger' : ''}">${escapeHtml(v)}</td>`;
 
     return `<!DOCTYPE html><html><head><meta charset="utf-8" /><style>
       * { box-sizing: border-box; }
@@ -258,6 +394,7 @@ export default function Reports({ companies, years, projects, receipts, expendit
       td { font-size: 11px; padding: 7px 10px; border: 1px solid ${theme.border}; }
       tr:nth-child(even) td { background: #fbfbff; }
       .num { text-align: right; }
+      .danger { color: ${theme.danger}; font-weight: 700; }
       .total td { font-weight: 700; background: ${theme.bg}; }
     </style></head><body>
       <h1>CSR Financial Report</h1>
@@ -266,8 +403,8 @@ export default function Reports({ companies, years, projects, receipts, expendit
       <table>
         <thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead>
         <tbody>
-          ${rows.map(r => `<tr>${r.map((c, i) => cellHtml(c, i)).join('')}</tr>`).join('')}
-          <tr class="total">${totals.map((c, i) => cellHtml(c, i)).join('')}</tr>
+          ${rows.map((r, ri) => `<tr>${r.map((c, i) => cellHtml(c, i, rowFlags[ri] || [])).join('')}</tr>`).join('')}
+          <tr class="total">${totals.map((c, i) => cellHtml(c, i, totalFlags)).join('')}</tr>
         </tbody>
       </table>
     </body></html>`;
@@ -298,9 +435,11 @@ export default function Reports({ companies, years, projects, receipts, expendit
   };
 
   const TABS: { key: TabKey; label: string }[] = [
+    { key: 'ledger', label: 'Transaction Ledger' },
     { key: 'year', label: 'Year-wise' },
     { key: 'company', label: 'Company-wise' },
     { key: 'project', label: 'Project-wise' },
+    { key: 'carry', label: 'Carry Forward' },
   ];
 
   return (
@@ -347,8 +486,8 @@ export default function Reports({ companies, years, projects, receipts, expendit
             ) : null}
           </Card>
 
-          {/* Segmented tabs */}
-          <View style={styles.segment}>
+          {/* Segmented tabs — five of them, so the bar scrolls horizontally */}
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.segment}>
             {TABS.map(t => {
               const on = tab === t.key;
               return (
@@ -357,7 +496,65 @@ export default function Reports({ companies, years, projects, receipts, expendit
                 </Pressable>
               );
             })}
-          </View>
+          </ScrollView>
+
+          {/* ── TRANSACTION LEDGER ── */}
+          {tab === 'ledger' && (
+            <>
+              <Card style={styles.chartCard}>
+                <Text style={styles.chartTitle}>Money In vs Money Out</Text>
+                <View style={styles.legendRow}>
+                  <Legend color={C_RECEIVED} text="Money In" />
+                  <Legend color={C_SPENT} text="Money Out" />
+                </View>
+                {ledgerRows.length === 0
+                  ? <Text style={styles.noData}>No transactions for this selection.</Text>
+                  : (
+                    <BarChart data={ledgerChart} barWidth={56} initialSpacing={30} roundedTop maxValue={ledgerMax} noOfSections={4} yAxisLabelTexts={ledgerYLabels} yAxisLabelWidth={46} yAxisTextStyle={styles.axisText} yAxisColor={theme.border} xAxisColor={theme.border} rulesColor={theme.border} height={180} isAnimated />
+                  )}
+              </Card>
+
+              <Card style={styles.tableCard}>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                  <DataTable>
+                    <DataTable.Header style={styles.dtHeader}>
+                      <Title w={100} text="Type" />
+                      <Title w={100} text="Date" />
+                      <Title w={140} text="Company" />
+                      <Title w={150} text="Project" />
+                      <Title w={90} text="FY" />
+                      <Title w={120} text="Base Amount" numeric />
+                      <Title w={120} text="Carry Forward" numeric />
+                      <Title w={130} text="Total Balance" numeric />
+                    </DataTable.Header>
+                    {ledgerRows.map(x => (
+                      <DataTable.Row key={x.id} style={styles.dtRow}>
+                        <Cell w={100} text={x.type} bold color={x.type === 'Receipt' ? theme.success : theme.danger} />
+                        <Cell w={100} text={fmtNice(x.date)} />
+                        <Cell w={140} text={companyName(x.companyId)} />
+                        <Cell w={150} text={projectName(x.projectId)} />
+                        <Cell w={90} text={shortYear(yearName(x.yearId))} />
+                        <Cell w={120} text={inr(x.base)} numeric color={x.type === 'Receipt' ? theme.success : theme.danger} />
+                        <Cell w={120} text={inr(x.carry)} numeric />
+                        <Cell w={130} text={inr(x.balance)} numeric bold color={x.balance < 0 ? theme.danger : theme.success} />
+                      </DataTable.Row>
+                    ))}
+                    <DataTable.Row style={styles.totalRow}>
+                      <Cell w={100} text="Total" bold />
+                      <Cell w={100} text="" />
+                      <Cell w={140} text="" />
+                      <Cell w={150} text="" />
+                      <Cell w={90} text="" />
+                      <Cell w={120} text="" numeric />
+                      <Cell w={120} text="" numeric />
+                      <Cell w={130} text={inr(ledgerFinal)} numeric bold color={ledgerFinal < 0 ? theme.danger : theme.success} />
+                    </DataTable.Row>
+                  </DataTable>
+                </ScrollView>
+                {ledgerRows.length === 0 && <EmptyState text="No transactions match the selected filters." />}
+              </Card>
+            </>
+          )}
 
           {/* ── YEAR-WISE ── */}
           {tab === 'year' && (
@@ -371,7 +568,44 @@ export default function Reports({ companies, years, projects, receipts, expendit
                 </View>
                 {yearChart.length === 0
                   ? <Text style={styles.noData}>No data for this selection.</Text>
-                  : <BarChart data={yearChart} barWidth={14} initialSpacing={14} roundedTop maxValue={chartMax} noOfSections={4} yAxisLabelTexts={yLabels} yAxisLabelWidth={46} yAxisTextStyle={styles.axisText} yAxisColor={theme.border} xAxisColor={theme.border} rulesColor={theme.border} height={180} width={SCREEN_W - 96} isAnimated />}
+                  : (
+                    <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                      <BarChart data={yearChart} barWidth={14} initialSpacing={14} roundedTop maxValue={chartMax} noOfSections={4} yAxisLabelTexts={yLabels} yAxisLabelWidth={46} yAxisTextStyle={styles.axisText} yAxisColor={theme.border} xAxisColor={theme.border} rulesColor={theme.border} height={180} width={yearChartWidth} isAnimated />
+                    </ScrollView>
+                  )}
+              </Card>
+
+              {/* Donut — share of expenditure by financial year */}
+              <Card style={styles.chartCard}>
+                <Text style={styles.chartTitle}>Expenditure Share by Year</Text>
+                {yearPie.length === 0 ? (
+                  <Text style={styles.noData}>No expenditure for this selection.</Text>
+                ) : (
+                  <View style={styles.pieWrap}>
+                    <PieChart
+                      donut
+                      data={yearPie.map(s => ({ value: s.value, color: s.color }))}
+                      radius={78}
+                      innerRadius={50}
+                      innerCircleColor={theme.surface}
+                      centerLabelComponent={() => (
+                        <View style={{ alignItems: 'center' }}>
+                          <Text style={styles.pieCenterCap}>SPENT</Text>
+                          <Text style={styles.pieCenterVal}>{inrShort(yearPieTotal)}</Text>
+                        </View>
+                      )}
+                    />
+                    <View style={styles.pieLegend}>
+                      {yearPie.map(s => (
+                        <View key={s.name} style={styles.pieLegendRow}>
+                          <View style={[styles.dot, { backgroundColor: s.color }]} />
+                          <Text style={styles.pieLegendName} numberOfLines={1}>{s.name}</Text>
+                          <Text style={styles.pieLegendPct}>{yearPieTotal ? Math.round((s.value / yearPieTotal) * 100) : 0}%</Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                )}
               </Card>
 
               <Card style={styles.tableCard}>
@@ -425,7 +659,11 @@ export default function Reports({ companies, years, projects, receipts, expendit
                 </View>
                 {companyChart.length === 0
                   ? <Text style={styles.noData}>No data for this selection.</Text>
-                  : <BarChart data={companyChart} barWidth={14} initialSpacing={14} roundedTop maxValue={chartMax} noOfSections={4} yAxisLabelTexts={yLabels} yAxisLabelWidth={46} yAxisTextStyle={styles.axisText} yAxisColor={theme.border} xAxisColor={theme.border} rulesColor={theme.border} height={180} width={SCREEN_W - 96} isAnimated />}
+                  : (
+                    <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                      <BarChart data={companyChart} barWidth={14} initialSpacing={14} roundedTop maxValue={chartMax} noOfSections={4} yAxisLabelTexts={yLabels} yAxisLabelWidth={46} yAxisTextStyle={styles.axisText} yAxisColor={theme.border} xAxisColor={theme.border} rulesColor={theme.border} height={180} width={companyChartWidth} isAnimated />
+                    </ScrollView>
+                  )}
               </Card>
 
               {/* Donut — share of total funds received by company */}
@@ -502,10 +740,10 @@ export default function Reports({ companies, years, projects, receipts, expendit
             <>
               <Card style={styles.chartCard}>
                 <Text style={styles.chartTitle}>Budget vs Expenditure by Project</Text>
+                <Text style={styles.chartSub}>Top 10 by budget</Text>
                 <View style={styles.legendRow}>
                   <Legend color={C_RECEIVED} text="Budget" />
                   <Legend color={C_SPENT} text="Expenditure" />
-                  <Legend color={C_BALANCE} text="Balance" />
                 </View>
                 {projectChart.length === 0
                   ? <Text style={styles.noData}>No data for this selection.</Text>
@@ -516,32 +754,32 @@ export default function Reports({ companies, years, projects, receipts, expendit
                   )}
               </Card>
 
-              {/* Donut — share of total approved budget by project */}
+              {/* Donut — projects grouped by status */}
               <Card style={styles.chartCard}>
-                <Text style={styles.chartTitle}>Budget Distribution by Project</Text>
-                {projectPie.length === 0 ? (
-                  <Text style={styles.noData}>No project budgets for this selection.</Text>
+                <Text style={styles.chartTitle}>Projects by Status</Text>
+                {statusPie.length === 0 ? (
+                  <Text style={styles.noData}>No projects for this selection.</Text>
                 ) : (
                   <View style={styles.pieWrap}>
                     <PieChart
                       donut
-                      data={projectPie.map(s => ({ value: s.value, color: s.color }))}
+                      data={statusPie.map(s => ({ value: s.value, color: s.color }))}
                       radius={78}
                       innerRadius={50}
                       innerCircleColor={theme.surface}
                       centerLabelComponent={() => (
                         <View style={{ alignItems: 'center' }}>
-                          <Text style={styles.pieCenterCap}>TOTAL</Text>
-                          <Text style={styles.pieCenterVal}>{inrShort(projectPieTotal)}</Text>
+                          <Text style={styles.pieCenterCap}>PROJECTS</Text>
+                          <Text style={styles.pieCenterVal}>{statusPieTotal}</Text>
                         </View>
                       )}
                     />
                     <View style={styles.pieLegend}>
-                      {projectPie.map(s => (
+                      {statusPie.map(s => (
                         <View key={s.name} style={styles.pieLegendRow}>
                           <View style={[styles.dot, { backgroundColor: s.color }]} />
                           <Text style={styles.pieLegendName} numberOfLines={1}>{s.name}</Text>
-                          <Text style={styles.pieLegendPct}>{projectPieTotal ? Math.round((s.value / projectPieTotal) * 100) : 0}%</Text>
+                          <Text style={styles.pieLegendPct}>{statusPieTotal ? Math.round((s.value / statusPieTotal) * 100) : 0}%</Text>
                         </View>
                       ))}
                     </View>
@@ -554,43 +792,77 @@ export default function Reports({ companies, years, projects, receipts, expendit
                 <DataTable>
                   <DataTable.Header style={styles.dtHeader}>
                     <Title w={170} text="Project" />
-                    <Title w={150} text="Company" />
-                    <Title w={100} text="Year" />
-                    <Title w={110} text="Status" />
-                    <Title w={130} text="Approved Budget" numeric />
-                    <Title w={120} text="Expenditure" numeric />
-                    <Title w={120} text="Balance" numeric />
-                    <Title w={90} text="Utilization" numeric />
+                    <Title w={160} text="Company" />
+                    <Title w={190} text="Period" />
+                    <Title w={130} text="Budget" numeric />
+                    <Title w={120} text="Received" numeric />
+                    <Title w={120} text="Spent" numeric />
+                    <Title w={100} text="Utilization" numeric />
+                    <Title w={120} text="Status" />
                   </DataTable.Header>
                   {projectRows.map(r => (
                     <DataTable.Row key={r.id} style={styles.dtRow}>
                       <Cell w={170} text={r.name} bold />
-                      <Cell w={150} text={r.company} />
-                      <Cell w={100} text={shortYear(r.year)} />
-                      <DataTable.Cell style={{ width: 110 }}>
+                      <Cell w={160} text={r.company} />
+                      <Cell w={190} text={r.period} />
+                      <Cell w={130} text={inr(r.budget)} numeric />
+                      <Cell w={120} text={inr(r.received)} numeric />
+                      <Cell w={120} text={inr(r.spent)} numeric color={theme.danger} />
+                      <Cell w={100} text={`${r.util.toFixed(1)}%`} numeric color={r.util > 90 ? theme.danger : theme.success} bold />
+                      <DataTable.Cell style={{ width: 120 }}>
                         <Pill text={projectStatusLabel(r.status)} tone={projectStatusTone(r.status)} />
                       </DataTable.Cell>
-                      <Cell w={130} text={inr(r.budget)} numeric />
-                      <Cell w={120} text={inr(r.spent)} numeric color={theme.danger} />
-                      <Cell w={120} text={inr(r.balance)} numeric color={r.balance < 0 ? theme.danger : theme.success} />
-                      <Cell w={90} text={`${r.util.toFixed(1)}%`} numeric color={r.util > 90 ? theme.danger : theme.success} bold />
                     </DataTable.Row>
                   ))}
                   <DataTable.Row style={styles.totalRow}>
                     <Cell w={170} text="Total" bold />
-                    <Cell w={150} text="" />
-                    <Cell w={100} text="" />
-                    <Cell w={110} text="" />
+                    <Cell w={160} text="" />
+                    <Cell w={190} text="" />
                     <Cell w={130} text={inr(projectTotals.budget)} numeric bold />
+                    <Cell w={120} text={inr(projectTotals.received)} numeric bold />
                     <Cell w={120} text={inr(projectTotals.spent)} numeric bold color={theme.danger} />
-                    <Cell w={120} text={inr(projectTotals.balance)} numeric bold color={projectTotals.balance < 0 ? theme.danger : theme.success} />
-                    <Cell w={90} text="" numeric />
+                    <Cell w={100} text="" numeric />
+                    <Cell w={120} text="" />
                   </DataTable.Row>
                 </DataTable>
               </ScrollView>
               {projectRows.length === 0 && <EmptyState text="No projects match the selected filters." />}
               </Card>
             </>
+          )}
+
+          {/* ── CARRY FORWARD ── */}
+          {tab === 'carry' && (
+            <Card style={styles.tableCard}>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                <DataTable>
+                  <DataTable.Header style={styles.dtHeader}>
+                    <Title w={180} text="Project" />
+                    <Title w={160} text="Company" />
+                    <Title w={130} text="Contribution %" numeric />
+                    <Title w={150} text="Carry Fwd Share" numeric />
+                    <Title w={130} text="Rolls Into" />
+                  </DataTable.Header>
+                  {carryRows.map(r => (
+                    <DataTable.Row key={r.key} style={styles.dtRow}>
+                      <Cell w={180} text={r.project} bold />
+                      <Cell w={160} text={r.company} />
+                      <Cell w={130} text={`${r.contribPct.toFixed(1)}%`} numeric />
+                      <Cell w={150} text={inr(r.share)} numeric color={theme.accent} bold />
+                      <Cell w={130} text={r.rollsInto} />
+                    </DataTable.Row>
+                  ))}
+                  <DataTable.Row style={styles.totalRow}>
+                    <Cell w={180} text="Total" bold />
+                    <Cell w={160} text="" />
+                    <Cell w={130} text="" numeric />
+                    <Cell w={150} text={inr(carryTotals.share)} numeric bold color={theme.accent} />
+                    <Cell w={130} text="" />
+                  </DataTable.Row>
+                </DataTable>
+              </ScrollView>
+              {carryRows.length === 0 && <EmptyState text="No ongoing projects with carry-forward match the selected filters." />}
+            </Card>
           )}
         </ScrollView>
       </View>
@@ -623,14 +895,16 @@ const styles = StyleSheet.create({
   filterRow: { flexDirection: 'row', gap: 12 },
   filterLabel: { fontSize: 9.5, color: theme.faint, fontWeight: '700', letterSpacing: 0.5, marginBottom: 6 },
 
+  // Five tabs — the bar scrolls horizontally so labels stay full-width & tappable.
   segment: { flexDirection: 'row', backgroundColor: '#ecedf6', borderRadius: 12, padding: 4, gap: 4 },
-  segBtn: { flex: 1, paddingVertical: 9, borderRadius: 9, alignItems: 'center' },
+  segBtn: { paddingHorizontal: 16, paddingVertical: 9, borderRadius: 9, alignItems: 'center' },
   segBtnOn: { backgroundColor: '#fff', shadowColor: '#1e1b4b', shadowOpacity: 0.08, shadowRadius: 6, shadowOffset: { width: 0, height: 2 }, elevation: 2 },
   segText: { fontSize: 12.5, fontWeight: '700', color: theme.muted },
   segTextOn: { color: theme.primary },
 
   chartCard: { gap: 6 },
   chartTitle: { fontSize: 15, fontWeight: '800', color: theme.text, marginBottom: 8 },
+  chartSub: { fontSize: 11.5, color: theme.faint, fontWeight: '600', marginTop: -6, marginBottom: 4 },
   axisText: { fontSize: 9.5, color: theme.faint },
   barLabel: { fontSize: 10, color: theme.muted, fontWeight: '700' },
   noData: { fontSize: 13, color: theme.faint, paddingVertical: 18, textAlign: 'center' },

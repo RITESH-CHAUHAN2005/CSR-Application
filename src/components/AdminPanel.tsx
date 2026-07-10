@@ -104,6 +104,7 @@ export default function AdminPanel() {
   const [uQuery, setUQuery] = useState('');
   const [uPage, setUPage] = useState(1);
   const [confirmDel, setConfirmDel] = useState<AppUser | null>(null);
+  const [confirmClearLogs, setConfirmClearLogs] = useState(false);
   const usersFiltered = useMemo(() => {
     const q = uQuery.trim().toLowerCase();
     if (!q) return users;
@@ -178,17 +179,17 @@ export default function AdminPanel() {
           </View>
 
           <Text style={styles.fLabel}>FULL NAME</Text>
-          <TextInput value={name} onChangeText={t => { setName(t); setFormErr(''); }}
+          <TextInput value={name} onChangeText={t => { setName(t); setFormErr(''); setFormOk(''); }}
             placeholder="Jane Doe" placeholderTextColor={theme.faint} style={styles.input} />
 
           <Text style={styles.fLabel}>EMAIL</Text>
-          <TextInput value={email} onChangeText={t => { setEmail(t); setFormErr(''); }}
+          <TextInput value={email} onChangeText={t => { setEmail(t); setFormErr(''); setFormOk(''); }}
             placeholder="jane@company.com" placeholderTextColor={theme.faint}
             autoCapitalize="none" keyboardType="email-address" autoCorrect={false} style={styles.input} />
 
           <Text style={styles.fLabel}>PASSWORD</Text>
           <View style={styles.pwdRow}>
-            <TextInput value={password} onChangeText={t => { setPassword(t); setFormErr(''); }}
+            <TextInput value={password} onChangeText={t => { setPassword(t); setFormErr(''); setFormOk(''); }}
               placeholder="Min 8 chars, 1 letter + 1 number" placeholderTextColor={theme.faint}
               secureTextEntry={!showPwd} autoCapitalize="none" autoCorrect={false}
               style={styles.pwdInput} />
@@ -198,7 +199,7 @@ export default function AdminPanel() {
           </View>
 
           <Text style={styles.fLabel}>ROLE</Text>
-          <Select value={role} options={ROLE_OPTIONS} onChange={v => setRole(v as Role)} />
+          <Select value={role} options={ROLE_OPTIONS} onChange={v => { setRole(v as Role); setFormOk(''); }} />
           {roleHint ? <Text style={styles.roleHint}>{roleHint}</Text> : null}
 
           {formErr ? <Text style={styles.err}>{formErr}</Text> : null}
@@ -246,7 +247,7 @@ export default function AdminPanel() {
               <View style={styles.cardHeadIcon}><ClockCounterClockwise size={18} color={theme.primary} weight="bold" /></View>
               <Text style={styles.cardTitle}>Activity Logs</Text>
             </View>
-            <Pressable onPress={clearLogs} hitSlop={8}
+            <Pressable onPress={() => setConfirmClearLogs(true)} hitSlop={8}
               style={({ pressed }) => [styles.clearBtn, pressed && { opacity: 0.7 }]}>
               <Trash size={14} color={theme.danger} weight="bold" />
               <Text style={styles.clearBtnText}>Clear Logs</Text>
@@ -293,6 +294,14 @@ export default function AdminPanel() {
         message={confirmDel ? `Remove "${confirmDel.name}" (${confirmDel.email})? They will no longer be able to sign in.` : ''}
         onCancel={() => setConfirmDel(null)}
         onConfirm={() => { if (confirmDel) removeUser(confirmDel.id); setConfirmDel(null); }}
+      />
+
+      <Confirm
+        visible={confirmClearLogs}
+        title="Clear all activity logs"
+        message="This will permanently delete the entire activity log. This can't be undone."
+        onCancel={() => setConfirmClearLogs(false)}
+        onConfirm={() => { clearLogs(); setConfirmClearLogs(false); }}
       />
 
       <Modal visible={!!breakdownFilter} title={breakdownTitle} onClose={() => setBreakdownFilter(null)}>

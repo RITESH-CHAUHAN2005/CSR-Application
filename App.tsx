@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 //  CSR — APP ROOT
-//  Owns: theme tokens, mock data, in-memory store, shared UI primitives,
-//  bottom tab navigation. Screens import primitives from here.
+//  Owns: theme tokens, auth store, shared UI primitives, bottom tab
+//  navigation. Screens import primitives from here.
 // ─────────────────────────────────────────────────────────────────────────
 import React, {
   createContext, useCallback, useContext, useEffect, useMemo, useRef, useState,
@@ -48,6 +48,7 @@ import { SignOut } from 'phosphor-react-native/src/icons/SignOut';
 import { ShieldCheck } from 'phosphor-react-native/src/icons/ShieldCheck';
 import { UserCircle } from 'phosphor-react-native/src/icons/UserCircle';
 import { Info } from 'phosphor-react-native/src/icons/Info';
+import { Database } from 'phosphor-react-native/src/icons/Database';
 
 import Dashboard from './src/components/Dashboard';
 import Companies from './src/components/Companies';
@@ -56,6 +57,7 @@ import Projects from './src/components/Projects';
 import FundReceipts from './src/components/FundReceipts';
 import Expenditures from './src/components/Expenditures';
 import Reports from './src/components/Reports';
+import MasterData from './src/components/MasterData';
 import AdminPanel from './src/components/AdminPanel';
 import Profile from './src/components/Profile';
 import Login from './src/components/Login';
@@ -71,24 +73,39 @@ export type FinancialYear = {
   id: string; name: string; start: string; end: string; active: boolean;
 };
 export type ProjectStatus = 'active' | 'completed' | 'on_hold' | 'cancelled';
+// Derived status drives the server's end-date rule (ongoing → +3 FYs, other → +1 FY)
+// and whether an expenditure can carry budget forward. Shown as "Ongoing" / "Other than Ongoing".
+export type DerivedStatus = 'ongoing' | 'other';
 export type Project = {
-  id: string; name: string; companyId: string; yearId: string;
+  id: string; name: string;
+  // A project is funded by ONE OR MORE companies. There is no financial year on a project.
+  companyIds: string[];
   category: string; location: string; budget: number;
-  status: ProjectStatus; description: string;
-  // `ongoing` marks a running project with no fixed end date (end date stays blank).
-  ongoing: boolean;
+  status: ProjectStatus; derivedStatus: DerivedStatus; description: string;
+  // startDate is required; endDate is derived server-side and read-only in the app.
   startDate: string; endDate: string; notes: string;
 };
+// 'company' = a donor company's direct contribution; 'other_source' = income earned
+// on that company's funds (Interest / SIP / FD…). companyId is required for both.
+export type ReceiptType = 'company' | 'other_source';
 export type FundReceipt = {
-  id: string; date: string; companyId: string; yearId: string;
-  reference: string; mode: PaymentMode; carryForward: number; amount: number;
-  notes: string;
+  id: string; date: string; receiptType: ReceiptType;
+  companyId: string; source: string; projectId: string; yearId: string;
+  // `reference` is labelled "Account Number" in the UI.
+  reference: string; amount: number; notes: string;
+  // mode + carryForward are LEGACY — still read for historical records, never collected on the form.
+  mode: PaymentMode; carryForward: number;
 };
 export type Expenditure = {
   id: string; date: string; projectId: string; companyId: string; yearId: string;
   category: string; approvedBy: string; amount: number;
+  // Unused budget rolled into next year — only meaningful when the project is Ongoing (0 otherwise).
+  carryForwardAmount: number;
   description: string; reference: string; notes: string;
 };
+// Editable dropdown value-lists edited on the Master Data screen.
+export type MasterType = 'category' | 'status' | 'source';
+export type MasterDataItem = { id: string; type: MasterType; value: string };
 
 // ── Auth / RBAC types ──
 // Three roles drive what a signed-in user can do across the whole app:
@@ -97,7 +114,7 @@ export type Expenditure = {
 //   viewer → read-only (Add buttons hidden, write actions are no-ops)
 export type Role = 'admin' | 'editor' | 'viewer';
 export type AppUser = {
-  id: string; name: string; email: string; password: string;
+  id: string; name: string; email: string;
   role: Role; company: string;
 };
 // One row per thing that happens in the app — sign-ins and every create /
@@ -106,39 +123,6 @@ export type ActivityLog = {
   id: string; at: string; userEmail: string; role: Role | ''; action: string;
 };
 
-// ── Seed data 
-export const SEED_YEARS: FinancialYear[] = [
-  { id: 'y1', name: 'FY 2023-24', start: '2023-04-01', end: '2024-03-31', active: false },
-  { id: 'y2', name: 'FY 2024-25', start: '2024-04-01', end: '2025-03-31', active: true },
-  { id: 'y3', name: 'FY 2025-26', start: '2025-04-01', end: '2026-03-31', active: false },
-];
-export const SEED_COMPANIES: Company[] = [
-  { id: 'c1', name: 'Tata Consultancy Services', cin: 'L22210MH1995PLC084781', contact: 'Anita Rao',   email: 'csr@tcs.com',      phone: '+919820011223', address: 'TCS House, Raveline Street, Fort, Mumbai - 400001',           notes: 'Primary CSR partner since 2018.' },
-  { id: 'c2', name: 'Infosys Foundation',         cin: 'U85110KA1996NPL019759', contact: 'Vikram Shah',  email: 'give@infosys.org', phone: '+918040022114', address: 'Electronics City, Hosur Road, Bengaluru - 560100',           notes: '' },
-  { id: 'c3', name: 'Wipro Cares',                cin: 'L32102KA1945PLC020800', contact: 'Meera Nair',   email: 'cares@wipro.com',  phone: '+918026667788', address: 'Doddakannelli, Sarjapur Road, Bengaluru - 560035',           notes: '' },
-  { id: 'c4', name: 'Reliance Foundation',        cin: 'U01100MH2010NPL206976', contact: 'Sanjay Gupta', email: 'rf@ril.com',       phone: '+912233445566', address: 'Maker Chambers IV, Nariman Point, Mumbai - 400021',           notes: '' },
-];
-export const SEED_PROJECTS: Project[] = [
-  { id: 'p1', name: 'Rural School Digital Labs',   companyId: 'c1', yearId: 'y2', category: 'Education',         location: 'Nagpur, MH',      budget: 1200000, status: 'active',    ongoing: false, description: 'Setting up computer labs in 15 government schools.',   startDate: '2024-04-15', endDate: '2025-03-31', notes: '' },
-  { id: 'p2', name: 'Clean Water Wells',           companyId: 'c1', yearId: 'y2', category: 'Infrastructure',    location: 'Jaipur, RJ',      budget: 850000,  status: 'completed', ongoing: false, description: 'Borewells and water purification for 8 villages.',     startDate: '2024-05-01', endDate: '2024-11-30', notes: '' },
-  { id: 'p3', name: 'Women Skilling Program',      companyId: 'c2', yearId: 'y2', category: 'Skill Development', location: 'Pune, MH',        budget: 700000,  status: 'active',    ongoing: false, description: 'Tailoring and computer skills for 300 women.',         startDate: '2024-06-10', endDate: '2025-03-31', notes: '' },
-  { id: 'p4', name: 'Urban Tree Plantation',       companyId: 'c3', yearId: 'y1', category: 'Environment',       location: 'Bengaluru, KA',   budget: 450000,  status: 'completed', ongoing: false, description: 'Planting 10,000 native saplings across the city.',     startDate: '2023-06-05', endDate: '2024-02-28', notes: '' },
-  { id: 'p5', name: 'Mobile Health Clinics',       companyId: 'c4', yearId: 'y2', category: 'Healthcare',        location: 'Lucknow, UP',     budget: 1500000, status: 'active',    ongoing: false, description: 'Two mobile clinics covering 25 remote villages.',      startDate: '2024-07-01', endDate: '2025-06-30', notes: '' },
-  { id: 'p6', name: 'Anganwadi Nutrition Drive',   companyId: 'c2', yearId: 'y1', category: 'Healthcare',        location: 'Bhopal, MP',      budget: 600000,  status: 'completed', ongoing: false, description: 'Mid-day nutrition supplements for 1,200 children.',    startDate: '2023-08-01', endDate: '2024-03-31', notes: '' },
-];
-export const SEED_RECEIPTS: FundReceipt[] = [
-  { id: 'r1', date: '2024-05-12', companyId: 'c1', yearId: 'y2', reference: 'NEFT/0001',  mode: 'NEFT',   carryForward: 0,      amount: 2500000, notes: '' },
-  { id: 'r2', date: '2024-06-03', companyId: 'c2', yearId: 'y2', reference: 'RTGS/8842',  mode: 'RTGS',   carryForward: 150000, amount: 1800000, notes: '' },
-  { id: 'r3', date: '2024-07-21', companyId: 'c4', yearId: 'y2', reference: 'CHQ/100245', mode: 'Cheque', carryForward: 0,      amount: 4200000, notes: '' },
-  { id: 'r4', date: '2023-08-09', companyId: 'c3', yearId: 'y1', reference: 'NEFT/0773',  mode: 'NEFT',   carryForward: 0,      amount: 2600000, notes: '' },
-];
-export const SEED_EXPENDITURES: Expenditure[] = [
-  { id: 'e1', date: '2024-06-18', projectId: 'p1', companyId: 'c1', yearId: 'y2', category: 'Equipment',      approvedBy: 'Trustee Board',      amount: 480000, description: 'Purchase of 30 desktop computers.',        reference: 'VCH/2024/0145', notes: '' },
-  { id: 'e2', date: '2024-07-02', projectId: 'p3', companyId: 'c2', yearId: 'y2', category: 'Training',       approvedBy: 'Executive Director', amount: 220000, description: 'Tailoring trainer fees for Q1.',           reference: 'VCH/2024/0162', notes: '' },
-  { id: 'e3', date: '2024-08-15', projectId: 'p5', companyId: 'c4', yearId: 'y2', category: 'Infrastructure', approvedBy: 'Trustee Board',      amount: 760000, description: 'Clinic vehicle fit-out and equipment.',     reference: 'VCH/2024/0188', notes: '' },
-  { id: 'e4', date: '2023-09-10', projectId: 'p4', companyId: 'c3', yearId: 'y1', category: 'Deepanshu',    approvedBy: 'Executive Director', amount: 130000, description: 'Saplings and planting labour.',             reference: 'VCH/2023/0421', notes: '' },
-];
-
 // Role display name + the dropdown options shown in "Add User Account".
 export const ROLE_LABEL: Record<Role, string> = { admin: 'Admin', editor: 'Editor', viewer: 'Viewer' };
 export const ROLE_TONE: Record<Role, 'primary' | 'amber' | 'neutral'> = { admin: 'primary', editor: 'amber', viewer: 'neutral' };
@@ -146,13 +130,6 @@ export const ROLE_OPTIONS: { label: string; value: Role }[] = [
   { value: 'admin',  label: 'Admin — full access + user management' },
   { value: 'editor', label: 'Editor — add / edit / delete records' },
   { value: 'viewer', label: 'Viewer — read-only access' },
-];
-
-// Seed accounts. The administrator matches the demo login on the sign-in screen.
-// New editor/viewer accounts created from the Admin Panel are added here in
-// memory and can sign in immediately (until the app cold-starts / DB lands).
-export const SEED_USERS: AppUser[] = [
-  { id: 'u1', name: 'CSR Administrator', email: 'admin@csr.com', password: 'Admin@123', role: 'admin', company: '' },
 ];
 
 // ── Theme ───────────────────────────────────────────────────────────────────
@@ -279,6 +256,14 @@ export const projectStatusLabel = (s: ProjectStatus): string =>
 export const projectStatusTone = (s: ProjectStatus): Tone =>
   s === 'active' ? 'success' : s === 'completed' ? 'primary' : s === 'on_hold' ? 'amber' : 'danger';
 
+// Derived status — shown as "Ongoing" / "Other than Ongoing" and picked from a dropdown.
+export const DERIVED_STATUS_OPTS: { label: string; value: DerivedStatus }[] = [
+  { value: 'ongoing', label: 'Ongoing' },
+  { value: 'other', label: 'Other than Ongoing' },
+];
+export const derivedStatusLabel = (d: DerivedStatus): string =>
+  d === 'ongoing' ? 'Ongoing' : 'Other than Ongoing';
+
 // Lets any screen's <Header> open the side drawer without prop-drilling.
 export const MenuContext = createContext<() => void>(() => {});
 
@@ -295,7 +280,7 @@ export type AuthValue = {
   logs: ActivityLog[];
   login: (email: string, password: string) => Promise<string | null>; // error message, or null on success
   logout: () => void;
-  createUser: (u: Omit<AppUser, 'id'>) => Promise<string | null>; // error message, or null on success
+  createUser: (u: Omit<AppUser, 'id'> & { password: string }) => Promise<string | null>; // error message, or null on success
   removeUser: (id: string) => void;
   clearLogs: () => void;
   refreshLogs: () => void;
@@ -395,7 +380,7 @@ export function Select({
   const close = () => { setOpen(false); setQuery(''); };
   const q = query.trim().toLowerCase();
   const shown = q ? options.filter(o => o.label.toLowerCase().includes(q)) : options;
-  const showSearch = options.length > 6;
+  const showSearch = options.length >= 6;
   return (
     <>
       <Pressable style={styles.input} onPress={() => { setQuery(''); setOpen(true); }}>
@@ -722,9 +707,7 @@ export function EmptyState({ text }: { text: string }) {
 }
 
 // ── App root: store + tab navigation ─────────────────────────────────────────
-type TabKey = 'dash' | 'companies' | 'years' | 'projects' | 'receipts' | 'expenditures' | 'reports' | 'admin' | 'profile';
-let _id = 1000;
-const nextId = () => 'x' + (++_id);
+type TabKey = 'dash' | 'companies' | 'years' | 'projects' | 'receipts' | 'expenditures' | 'reports' | 'masterData' | 'admin' | 'profile';
 
 // `adminOnly` tabs are hidden from editors & viewers (they never see the Admin
 // Panel). Every other tab — including "My Profile" — is visible to all roles.
@@ -736,6 +719,7 @@ const TABS: { key: TabKey; label: string; Icon: any; adminOnly?: boolean }[] = [
   { key: 'receipts',     label: 'Fund Receipts', Icon: Receipt },
   { key: 'expenditures', label: 'Expenditures',  Icon: HandCoins },
   { key: 'reports',      label: 'Reports',       Icon: ChartBar },
+  { key: 'masterData',   label: 'Master Data',   Icon: Database },
   { key: 'admin',        label: 'Admin Panel',   Icon: ShieldCheck, adminOnly: true },
   { key: 'profile',      label: 'My Profile',    Icon: UserCircle },
 ];
@@ -749,6 +733,7 @@ function Root() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [receipts, setReceipts] = useState<FundReceipt[]>([]);
   const [expenditures, setExpenditures] = useState<Expenditure[]>([]);
+  const [masterData, setMasterData] = useState<MasterDataItem[]>([]);
 
   // Pull every list fresh from the backend. The app and the website share one
   // backend + database, so re-fetching keeps the app in sync with whatever the
@@ -763,6 +748,7 @@ function Root() {
     api.list('projects').then(setProjects).catch(() => {});
     api.list('receipts').then(setReceipts).catch(() => {});
     api.list('expenditures').then(setExpenditures).catch(() => {});
+    api.list('masterData').then(setMasterData).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -774,16 +760,24 @@ function Root() {
   // Write actions are gated by role (viewers are read-only) and every mutation
   // is appended to the activity log. These wrappers capture fresh state each
   // render so deletes can resolve a friendly name for the log message.
-  const { user, canEdit, canManageUsers, logout, logActivity: note } = useAuth();
+  const { canEdit, canManageUsers, logout, logActivity: note } = useAuth();
   // Run a write only if allowed, and surface any backend failure to the user
   // (so an edit/delete never fails silently — you always see why it didn't save).
-  const guard = (fn: () => void | Promise<void>) => {
-    if (!canEdit) return;
+  // Resolves to false when the write was blocked or failed, so callers that
+  // need to know (e.g. keeping a form open on failure) can await it; existing
+  // fire-and-forget callers are unaffected since they just ignore the result.
+  const guard = (fn: () => void | Promise<void>): Promise<boolean> => {
+    if (!canEdit) return Promise.resolve(false);
     const r = fn();
     if (r && typeof (r as any).catch === 'function') {
-      (r as Promise<void>).catch((e: any) =>
-        Alert.alert('Action failed', e?.message || 'Could not reach the server. Please try again.'));
+      return (r as Promise<void>)
+        .then(() => true)
+        .catch((e: any) => {
+          Alert.alert('Action failed', e?.message || 'Could not reach the server. Please try again.');
+          return false;
+        });
     }
+    return Promise.resolve(true);
   };
   // Tabs visible to the signed-in user:
   //   • Admin Panel  → admins only
@@ -806,13 +800,13 @@ function Root() {
       setCompanies(p => p.map(x => x.id === id ? row : x));
       note(`Updated company "${c.name}"`);
     }),
+    // Deleting a company does NOT cascade — its projects, receipts and
+    // expenditures survive as orphans (matches the server; only the company
+    // document is removed).
     remove: (id: string) => guard(async () => {
       const nm = companies.find(x => x.id === id)?.name ?? 'company';
       await api.remove('companies', id);
       setCompanies(p => p.filter(x => x.id !== id));
-      setProjects(p => p.filter(x => x.companyId !== id));
-      setReceipts(p => p.filter(x => x.companyId !== id));
-      setExpenditures(p => p.filter(x => x.companyId !== id));
       note(`Deleted company "${nm}"`);
     }),
   };
@@ -880,6 +874,13 @@ function Root() {
       setReceipts(p => [row, ...p]);
       note(`Recorded fund receipt of ${inr(r.amount)}`);
     }),
+    // Multi-company entry: every filled row is written as its own receipt, all-or-nothing.
+    bulkAdd: (rows: Omit<FundReceipt, 'id'>[]) => guard(async () => {
+      const created: FundReceipt[] = await api.bulkCreateReceipts(rows);
+      setReceipts(p => [...created, ...p]);
+      const sum = rows.reduce((s, r) => s + (r.amount || 0), 0);
+      note(`Recorded ${created.length} fund receipt${created.length === 1 ? '' : 's'} totalling ${inr(sum)}`);
+    }),
     update: (id: string, r: Omit<FundReceipt, 'id'>) => guard(async () => {
       const row: FundReceipt = await api.update('receipts', id, r);
       setReceipts(p => p.map(x => x.id === id ? row : x));
@@ -912,6 +913,26 @@ function Root() {
     }),
   };
 
+  // Master Data — editable Category / Status / Source value lists.
+  const masterDataApi = {
+    add: (m: Omit<MasterDataItem, 'id'>) => guard(async () => {
+      const row: MasterDataItem = await api.create('masterData', m);
+      setMasterData(p => [...p, row]);
+      note(`Added ${m.type} "${m.value}"`);
+    }),
+    update: (id: string, m: Omit<MasterDataItem, 'id'>) => guard(async () => {
+      const row: MasterDataItem = await api.update('masterData', id, m);
+      setMasterData(p => p.map(x => x.id === id ? row : x));
+      note(`Updated ${m.type} "${m.value}"`);
+    }),
+    remove: (id: string) => guard(async () => {
+      const it = masterData.find(x => x.id === id);
+      await api.remove('masterData', id);
+      setMasterData(p => p.filter(x => x.id !== id));
+      note(`Deleted ${it?.type ?? 'value'} "${it?.value ?? ''}"`);
+    }),
+  };
+
   const active = TABS.find(t => t.key === tab);
   const go = (k: TabKey) => { setTab(k); setMenuOpen(false); reloadAll(); };
 
@@ -922,16 +943,17 @@ function Root() {
           {tab === 'dash' && <Dashboard companies={companies} years={years} projects={projects} receipts={receipts} expenditures={expenditures} />}
           {tab === 'companies' && <Companies companies={companies} projects={projects} years={years} receipts={receipts} expenditures={expenditures} {...companyApi} />}
           {tab === 'years' && <FinancialYears years={years} {...yearApi} />}
-          {tab === 'projects' && <Projects projects={projects} companies={companies} years={years} {...projectApi} />}
-          {tab === 'receipts' && <FundReceipts receipts={receipts} companies={companies} years={years} {...receiptApi} />}
-          {tab === 'expenditures' && <Expenditures expenditures={expenditures} projects={projects} companies={companies} years={years} {...expenditureApi} />}
+          {tab === 'projects' && <Projects projects={projects} companies={companies} years={years} masterData={masterData} {...projectApi} />}
+          {tab === 'receipts' && <FundReceipts receipts={receipts} companies={companies} years={years} projects={projects} masterData={masterData} {...receiptApi} />}
+          {tab === 'expenditures' && <Expenditures expenditures={expenditures} projects={projects} companies={companies} years={years} masterData={masterData} {...expenditureApi} />}
           {tab === 'reports' && <Reports companies={companies} years={years} projects={projects} receipts={receipts} expenditures={expenditures} />}
+          {tab === 'masterData' && <MasterData items={masterData} {...masterDataApi} />}
           {tab === 'admin' && canManageUsers && <AdminPanel />}
           {tab === 'profile' && <Profile />}
         </View>
 
         {/* Side hamburger drawer — holds the page navigation */}
-        <RNModal visible={menuOpen} transparent animationType="fade" onRequestClose={() => setMenuOpen(false)}>
+        <RNModal visible={menuOpen} transparent animationType="slide" onRequestClose={() => setMenuOpen(false)}>
           <Pressable style={styles.drawerBackdrop} onPress={() => setMenuOpen(false)}>
             <Pressable
               style={[styles.drawer, { paddingTop: insets.top + 22, paddingBottom: insets.bottom + 18 }]}
@@ -983,12 +1005,12 @@ function Root() {
 }
 
 // Gate the whole app behind the login screen and own the auth store: the user
-// list, the signed-in user, and the activity log. State is in-memory only, so
-// it resets on a cold start (the login page shows each launch) — once the
-// PostgreSQL + Node API lands these handlers call the backend instead.
-// Key under which the signed-in user is persisted on the device, so a hot
+// list, the signed-in user, and the activity log. Every handler here calls the
+// live backend (api.*); the signed-in user is persisted to AsyncStorage under
+// AUTH_KEY and restored on launch (see the `hydrated` gate below), so a hot
 // reload (during development) or an app restart keeps you logged in — you only
 // sign in once.
+// Key under which the signed-in user is persisted on the device.
 const AUTH_KEY = 'csr_user';
 
 function AuthGate() {
@@ -1068,9 +1090,12 @@ function AuthGate() {
     removeUser: (id) => {
       api.removeUser(id)
         .then(() => { setUsers(p => p.filter(u => u.id !== id)); refreshLogs(); })
-        .catch(() => {});
+        .catch((e: any) => Alert.alert('Action failed', e?.message || 'Could not reach the server. Please try again.'));
     },
-    clearLogs: () => { api.clearLogs().then(() => setLogs([])).catch(() => {}); },
+    clearLogs: () => {
+      api.clearLogs().then(() => setLogs([]))
+        .catch((e: any) => Alert.alert('Action failed', e?.message || 'Could not reach the server. Please try again.'));
+    },
     refreshLogs: () => refreshLogs(),
     // Writes are auto-logged server-side; give the log a beat to persist, then refetch.
     logActivity: () => { setTimeout(() => refreshLogs(), 700); },

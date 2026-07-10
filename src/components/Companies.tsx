@@ -2,7 +2,7 @@
 // "View Details" page (contact, fund overview, year-wise summary, projects,
 // fund receipts) mirroring the web app's company detail page.
 import React, { useMemo, useState } from 'react';
-import { Modal as RNModal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, Modal as RNModal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { MagnifyingGlass } from 'phosphor-react-native/src/icons/MagnifyingGlass';
 import { PencilSimple } from 'phosphor-react-native/src/icons/PencilSimple';
 import { Trash } from 'phosphor-react-native/src/icons/Trash';
@@ -33,6 +33,10 @@ type Props = {
 };
 
 const blank = { name: '', cin: '', contact: '', phone: '', email: '', address: '', notes: '' };
+// Email is optional, but if filled in it must be a real address — the backend
+// rejects a malformed one with a generic "Validation failed", so catch it here
+// first and tell the user exactly what to fix.
+const emailValid = (e: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e.trim());
 
 export default function Companies({ companies, projects, years, receipts, expenditures, add, update, remove }: Props) {
   const { canEdit } = useAuth();
@@ -59,9 +63,16 @@ export default function Companies({ companies, projects, years, receipts, expend
     setShowForm(true);
   };
   const save = () => {
-    if (!form.name.trim()) return;
+    if (!form.name.trim()) {
+      Alert.alert('Missing name', 'Company Name is required.');
+      return;
+    }
+    if (form.email.trim() && !emailValid(form.email)) {
+      Alert.alert('Invalid email', 'Please enter a valid email address, or leave the Email field blank.');
+      return;
+    }
     const payload: Omit<Company, 'id'> = {
-      name: form.name.trim(), cin: form.cin.trim(), contact: form.contact.trim(),
+      name: form.name.trim(), cin: form.cin.trim().toUpperCase(), contact: form.contact.trim(),
       phone: form.phone.trim(), email: form.email.trim(),
       address: form.address.trim(), notes: form.notes.trim(),
     };
@@ -71,7 +82,7 @@ export default function Companies({ companies, projects, years, receipts, expend
 
   return (
     <View style={{ flex: 1 }}>
-      <Header title="Donor Companies" subtitle={`${companies.length} companies`} action={<AddPill onPress={openAdd} />} />
+      <Header title="Donor Companies" subtitle={`${companies.length} ${companies.length === 1 ? 'company' : 'companies'}`} action={<AddPill onPress={openAdd} />} />
       <ScrollView contentContainerStyle={styles.body} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
         <View style={styles.search}>
           <MagnifyingGlass size={18} color={theme.faint} />
@@ -82,7 +93,7 @@ export default function Companies({ companies, projects, years, receipts, expend
 
         {filtered.map((c, i) => {
           const chip = iconChipColors[i % iconChipColors.length];
-          const projCount = projects.filter(p => p.companyId === c.id).length;
+          const projCount = projects.filter(p => p.companyIds.includes(c.id)).length;
           const bal = companyBalance(c.id, receipts, expenditures);
           return (
             <Card key={c.id} style={styles.card}>
@@ -160,7 +171,7 @@ export default function Companies({ companies, projects, years, receipts, expend
       <Confirm
         visible={!!delId}
         title="Delete company?"
-        message="This will also remove its projects, receipts and expenditures. This can't be undone."
+        message="This removes only the company. Its projects, receipts and expenditures are kept (they'll no longer be linked to a company). This can't be undone."
         onCancel={() => setDelId(null)}
         onConfirm={() => { if (delId) remove(delId); setDelId(null); }}
       />
@@ -177,7 +188,7 @@ function CompanyDetail({
   onClose: () => void; onEdit: () => void;
 }) {
   const { canEdit } = useAuth();
-  const projList = projects.filter(p => p.companyId === c.id);
+  const projList = projects.filter(p => p.companyIds.includes(c.id));
   const cReceipts = receipts.filter(r => r.companyId === c.id);
   const activeProj = projList.filter(p => p.status === 'active').length;
   const yearName = (id: string) => years.find(y => y.id === id)?.name ?? '—';
@@ -275,7 +286,7 @@ function CompanyDetail({
                   <View key={p.id} style={styles.projRow}>
                     <View style={{ flex: 1 }}>
                       <Text style={styles.projName} numberOfLines={1}>{p.name}</Text>
-                      <Text style={styles.projMeta} numberOfLines={1}>{yearName(p.yearId)} · {p.category} · {p.location}</Text>
+                      <Text style={styles.projMeta} numberOfLines={1}>{p.category || '—'} · {p.location || '—'}</Text>
                     </View>
                     <Text style={styles.projBudget}>{inr(p.budget)}</Text>
                     <Pill text={projectStatusLabel(p.status)} tone={projectStatusTone(p.status)} />

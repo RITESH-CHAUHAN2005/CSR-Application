@@ -96,14 +96,16 @@ export default function Dashboard({
   const [summary, setSummary] = useState<any>(null);
   useEffect(() => {
     api.dashboard().then(setSummary).catch(() => {});
-  }, [receipts, expenditures, projects, years]);
+  }, [receipts, expenditures, projects, years, companies]);
 
   const received = summary ? summary.totalReceived : sumReceived(receipts);
   const expenditure = summary ? summary.totalExpenditure : sumExpenditure(expenditures);
   const balance = summary ? summary.totalBalance : received - expenditure;
 
   const active = summary ? summary.activeProjects : projects.filter(p => p.status === 'active').length;
-  const completed = summary ? summary.completedProjects : projects.length - active;
+  const completed = summary
+    ? summary.completedProjects
+    : projects.filter(p => p.status === 'completed').length;
   const totalProj = summary ? summary.totalProjects : projects.length;
 
   // "this year" figures — from the backend when available (uses the current
@@ -174,7 +176,7 @@ export default function Dashboard({
         carry: companyCarryForward(c.id, receipts),
         expenditure: companyExpenditure(c.id, expenditures),
         balance: companyBalance(c.id, receipts, expenditures),
-        projects: projects.filter(p => p.companyId === c.id).length,
+        projects: projects.filter(p => p.companyIds.includes(c.id)).length,
       }));
   const posRows = [...posBase].sort((a, b) => {
     const av = sort.key === 'company' ? a.company.toLowerCase() : (a as any)[sort.key];
@@ -241,42 +243,46 @@ export default function Dashboard({
             </View>
           </View>
 
-          <View style={styles.plot}>
-            {/* horizontal gridlines + y-axis labels */}
-            {[1, 0.75, 0.5, 0.25, 0].map(f => (
-              <View
-                key={f}
-                style={[styles.gridRow, { bottom: AXIS_PAD + f * PLOT_H }]}
-              >
-                <Text style={styles.gridLabel}>
-                  {f === 0 ? '₹0' : inrShort(maxBar * f)}
-                </Text>
-                <View style={styles.gridLine} />
-              </View>
-            ))}
-            {/* bars */}
-            <View style={styles.barsRow}>
-              {yearRows.map(r => (
-                <View key={r.name} style={styles.barGroup}>
-                  <View style={styles.barPair}>
-                    <Bar
-                      value={r.received}
-                      max={maxBar}
-                      color={theme.primary}
-                    />
-                    <Bar
-                      value={r.expenditure}
-                      max={maxBar}
-                      color={theme.accent}
-                    />
-                  </View>
-                  <Text style={styles.barLabel} numberOfLines={1}>
-                    {r.name.replace('FY ', '')}
+          {yearRows.length === 0 ? (
+            <Text style={styles.empty}>No financial years yet.</Text>
+          ) : (
+            <View style={styles.plot}>
+              {/* horizontal gridlines + y-axis labels */}
+              {[1, 0.75, 0.5, 0.25, 0].map(f => (
+                <View
+                  key={f}
+                  style={[styles.gridRow, { bottom: AXIS_PAD + f * PLOT_H }]}
+                >
+                  <Text style={styles.gridLabel}>
+                    {f === 0 ? '₹0' : inrShort(maxBar * f)}
                   </Text>
+                  <View style={styles.gridLine} />
                 </View>
               ))}
+              {/* bars */}
+              <View style={styles.barsRow}>
+                {yearRows.map(r => (
+                  <View key={r.name} style={styles.barGroup}>
+                    <View style={styles.barPair}>
+                      <Bar
+                        value={r.received}
+                        max={maxBar}
+                        color={theme.primary}
+                      />
+                      <Bar
+                        value={r.expenditure}
+                        max={maxBar}
+                        color={theme.accent}
+                      />
+                    </View>
+                    <Text style={styles.barLabel} numberOfLines={1}>
+                      {r.name.replace('FY ', '')}
+                    </Text>
+                  </View>
+                ))}
+              </View>
             </View>
-          </View>
+          )}
         </Card>
 
         {/* Fund Distribution by Company */}
@@ -319,73 +325,79 @@ export default function Dashboard({
           <Text style={[styles.cardTitle, { paddingHorizontal: 16 }]}>
             Company Fund Positions
           </Text>
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={{ paddingHorizontal: 16 }}
-          >
-            <View>
-              <View style={[styles.tRow, styles.tHeadRow]}>
-                {POS_COLS.map(col => {
-                  const on = sort.key === col.key;
-                  return (
-                    <Pressable
-                      key={col.key}
-                      onPress={() => toggleSort(col.key)}
+          {posRows.length === 0 ? (
+            <Text style={[styles.empty, { paddingHorizontal: 16 }]}>
+              No companies yet.
+            </Text>
+          ) : (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={{ paddingHorizontal: 16 }}
+            >
+              <View>
+                <View style={[styles.tRow, styles.tHeadRow]}>
+                  {POS_COLS.map(col => {
+                    const on = sort.key === col.key;
+                    return (
+                      <Pressable
+                        key={col.key}
+                        onPress={() => toggleSort(col.key)}
+                        style={[
+                          styles[col.w],
+                          col.right && { alignItems: 'flex-end' },
+                        ]}
+                      >
+                        <Text
+                          style={[styles.th, on && { color: theme.primary }]}
+                          numberOfLines={1}
+                        >
+                          {col.label}
+                          {on ? (sort.dir === 'asc' ? ' ↑' : ' ↓') : ''}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+                {posRows.map(r => (
+                  <View key={r.id} style={styles.tRow}>
+                    <Text
                       style={[
-                        styles[col.w],
-                        col.right && { alignItems: 'flex-end' },
+                        styles.td,
+                        styles.cCompany,
+                        { fontWeight: '700', color: theme.text },
+                      ]}
+                      numberOfLines={1}
+                    >
+                      {r.company}
+                    </Text>
+                    <Text style={[styles.td, styles.cNum]}>
+                      {inr(r.received)}
+                    </Text>
+                    <Text style={[styles.td, styles.cNum]}>{inr(r.carry)}</Text>
+                    <Text
+                      style={[styles.td, styles.cNum, { color: theme.danger }]}
+                    >
+                      {inr(r.expenditure)}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.td,
+                        styles.cNum,
+                        {
+                          color: r.balance >= 0 ? theme.success : theme.danger,
+                          fontWeight: '800',
+                        },
                       ]}
                     >
-                      <Text
-                        style={[styles.th, on && { color: theme.primary }]}
-                        numberOfLines={1}
-                      >
-                        {col.label}
-                        {on ? (sort.dir === 'asc' ? ' ↑' : ' ↓') : ''}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
+                      {inr(r.balance)}
+                    </Text>
+                    <Text style={[styles.td, styles.cProj]}>{r.projects}</Text>
+                  </View>
+                ))}
               </View>
-              {posRows.map(r => (
-                <View key={r.id} style={styles.tRow}>
-                  <Text
-                    style={[
-                      styles.td,
-                      styles.cCompany,
-                      { fontWeight: '700', color: theme.text },
-                    ]}
-                    numberOfLines={1}
-                  >
-                    {r.company}
-                  </Text>
-                  <Text style={[styles.td, styles.cNum]}>
-                    {inr(r.received)}
-                  </Text>
-                  <Text style={[styles.td, styles.cNum]}>{inr(r.carry)}</Text>
-                  <Text
-                    style={[styles.td, styles.cNum, { color: theme.danger }]}
-                  >
-                    {inr(r.expenditure)}
-                  </Text>
-                  <Text
-                    style={[
-                      styles.td,
-                      styles.cNum,
-                      {
-                        color: r.balance >= 0 ? theme.success : theme.danger,
-                        fontWeight: '800',
-                      },
-                    ]}
-                  >
-                    {inr(r.balance)}
-                  </Text>
-                  <Text style={[styles.td, styles.cProj]}>{r.projects}</Text>
-                </View>
-              ))}
-            </View>
-          </ScrollView>
+            </ScrollView>
+          )}
         </Card>
       </ScrollView>
     </View>

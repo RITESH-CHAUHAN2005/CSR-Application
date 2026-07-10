@@ -78,7 +78,7 @@ http.interceptors.response.use(
         ? d.errors.map((e: any) => e?.message || e?.msg || e).filter(Boolean).join('; ')
         : Object.values(d.errors).map((e: any) => e?.message || e).filter(Boolean).join('; ');
     }
-    msg = msg || err?.message || 'Network error. Check your connection.';
+    if (!msg) msg = err?.response ? err?.message : 'Could not reach the server. Check your connection.';
     return Promise.reject(new Error(msg));
   },
 );
@@ -86,6 +86,26 @@ http.interceptors.response.use(
 // ── shape helpers ─────────────────────────────────────────────────────────────
 const idStr = (v: any) => (v == null ? '' : typeof v === 'object' ? String(v.id || v._id || '') : String(v));
 const num = (n: any) => Number(n) || 0;
+
+// base64 of a binary string. Uses Hermes' global btoa when present, else a small
+// pure-JS encoder (avoids a Buffer/node dependency). Used only for document downloads.
+const B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function base64Encode(binary: string): string {
+  const g: any = typeof globalThis !== 'undefined' ? globalThis : {};
+  if (typeof g.btoa === 'function') return g.btoa(binary);
+  let out = '';
+  for (let i = 0; i < binary.length; i += 3) {
+    const a = binary.charCodeAt(i);
+    const b = i + 1 < binary.length ? binary.charCodeAt(i + 1) : NaN;
+    const c = i + 2 < binary.length ? binary.charCodeAt(i + 2) : NaN;
+    const e1 = a >> 2;
+    const e2 = ((a & 3) << 4) | (isNaN(b) ? 0 : b >> 4);
+    const e3 = isNaN(b) ? 64 : (((b & 15) << 2) | (isNaN(c) ? 0 : c >> 6));
+    const e4 = isNaN(c) ? 64 : c & 63;
+    out += B64_CHARS[e1] + B64_CHARS[e2] + (e3 === 64 ? '=' : B64_CHARS[e3]) + (e4 === 64 ? '=' : B64_CHARS[e4]);
+  }
+  return out;
+}
 const MONTHS: Record<string, string> = {
   Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06',
   Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12',
@@ -154,43 +174,56 @@ const RES: Record<string, { path: string; toClient: (d: any) => any; toDb: (b: a
     path: 'projects',
     toClient: (d) => ({
       id: idStr(d.id ?? d._id), name: d.name || '',
-      // The live schema stores companies as an ARRAY (`companyIds`) — this app's UI
-      // only supports one company per project, so read the first entry.
-      companyId: idStr(Array.isArray(d.companyIds) ? d.companyIds[0] : (d.company ?? d.companyId)),
-      yearId: idStr(d.financialYear ?? d.financialYearId),
+      // A project is funded by ONE OR MORE companies — the live schema stores them
+      // as an array (`companyIds`). Read the whole array (falling back to any legacy
+      // singular field so old documents still show a company).
+      companyIds: Array.isArray(d.companyIds)
+        ? d.companyIds.map(idStr).filter(Boolean)
+        : (d.company ?? d.companyId ? [idStr(d.company ?? d.companyId)] : []),
       category: d.category || '', location: d.location || '', budget: num(d.budget),
       status: d.status || 'active',
       // The live schema has no boolean `ongoing` — it's `derivedStatus: 'ongoing' | 'other'`.
-      ongoing: d.derivedStatus === 'ongoing' || !!d.ongoing,
+      derivedStatus: d.derivedStatus === 'ongoing' ? 'ongoing' : 'other',
       description: d.description || '',
-      startDate: typeof d.startDate === 'string' ? d.startDate.slice(0, 10) : dstr(d.startDate),
-      endDate: typeof d.endDate === 'string' ? d.endDate.slice(0, 10) : dstr(d.endDate), notes: d.notes || '',
+      startDate: dstr(d.startDate),
+      // endDate is derived server-side from the start date's financial year — never
+      // sent by the client, only read back for display.
+      endDate: dstr(d.endDate), notes: d.notes || '',
     }),
     // The live Project schema REQUIRES `companyIds` (non-empty array) and
-    // `derivedStatus` ('ongoing' | 'other') — it has no `companyId`/`companyId`
-    // singular or boolean `ongoing` field. Sending the old shape silently fails
-    // Zod validation (companyIds missing), so creates/edits from this app never
-    // actually saved. This app only picks one company, so wrap it in an array.
+    // `derivedStatus` ('ongoing' | 'other'). Projects have NO financial year and
+    // NO client-supplied end date (both are omitted here — the server derives the
+    // end date from the start date's FY).
     toDb: (b) => ({
-      name: b.name, companyIds: b.companyId ? [b.companyId] : [],
+      name: b.name, companyIds: Array.isArray(b.companyIds) ? b.companyIds.filter(Boolean) : [],
       category: b.category || '', location: b.location || '', budget: num(b.budget),
-      status: b.status || 'active', derivedStatus: b.ongoing ? 'ongoing' : 'other',
+      status: b.status || 'active', derivedStatus: b.derivedStatus === 'ongoing' ? 'ongoing' : 'other',
       description: b.description || '',
-      startDate: b.startDate || '', endDate: b.endDate || '', notes: b.notes || '',
+      startDate: b.startDate || '', notes: b.notes || '',
     }),
   },
   receipts: {
     path: 'fund-receipts',
     toClient: (d) => ({
       id: idStr(d.id ?? d._id), date: dstr(d.date),
-      companyId: idStr(d.company ?? d.companyId), yearId: idStr(d.financialYear ?? d.financialYearId),
-      reference: d.reference || '', mode: d.mode || 'NEFT',
-      carryForward: num(d.carryForward), amount: num(d.amount), notes: d.notes || '',
+      // 'company' = a donor company's direct contribution; 'other_source' = income
+      // earned on that company's funds (Interest/SIP/FD…). companyId is set for both.
+      receiptType: d.receiptType === 'other_source' ? 'other_source' : 'company',
+      companyId: idStr(d.company ?? d.companyId), source: d.source || '',
+      projectId: idStr(d.project ?? d.projectId),
+      yearId: idStr(d.financialYear ?? d.financialYearId),
+      // `reference` is shown as "Account Number" in the UI (field name kept to avoid a migration).
+      reference: d.reference || '', amount: num(d.amount), notes: d.notes || '',
+      // mode + carryForward are LEGACY — read for historical records, never collected on the form.
+      mode: d.mode || 'NEFT', carryForward: num(d.carryForward),
     }),
     toDb: (b) => ({
-      date: b.date || null, companyId: b.companyId, financialYearId: b.yearId,
-      reference: b.reference || '', mode: b.mode || 'NEFT',
-      carryForward: num(b.carryForward), amount: num(b.amount), notes: b.notes || '',
+      date: b.date || null, receiptType: b.receiptType || 'company',
+      companyId: b.companyId, source: b.source || '',
+      // projectId is optional — omit it entirely when unset so the server treats it as unallocated.
+      ...(b.projectId ? { projectId: b.projectId } : {}),
+      financialYearId: b.yearId, reference: b.reference || '',
+      amount: num(b.amount), notes: b.notes || '',
     }),
   },
   expenditures: {
@@ -199,13 +232,22 @@ const RES: Record<string, { path: string; toClient: (d: any) => any; toDb: (b: a
       id: idStr(d.id ?? d._id), date: dstr(d.date), projectId: idStr(d.project ?? d.projectId),
       companyId: idStr(d.company ?? d.companyId), yearId: idStr(d.financialYear ?? d.financialYearId),
       category: d.category || '', approvedBy: d.approvedBy || '', amount: num(d.amount),
+      // Unused budget rolled into next year — only meaningful when the project is Ongoing.
+      carryForwardAmount: num(d.carryForwardAmount),
       description: d.description || '', reference: d.reference || '', notes: d.notes || '',
     }),
     toDb: (b) => ({
       date: b.date || null, projectId: b.projectId, companyId: b.companyId, financialYearId: b.yearId,
       category: b.category || '', approvedBy: b.approvedBy || '', amount: num(b.amount),
+      carryForwardAmount: num(b.carryForwardAmount),
       description: b.description || '', reference: b.reference || '', notes: b.notes || '',
     }),
+  },
+  // Editable dropdown value-lists (Category / Status / Source) shown on the Master Data screen.
+  masterData: {
+    path: 'master-data',
+    toClient: (d) => ({ id: idStr(d.id ?? d._id), type: d.type || '', value: d.value || '' }),
+    toDb: (b) => ({ type: b.type, value: b.value }),
   },
 };
 
@@ -245,4 +287,59 @@ export const api = {
   create: async (resource: string, body: any) => { const c = RES[resource]; const { data } = await http.post('/' + c.path, c.toDb(body)); return c.toClient(data); },
   update: async (resource: string, id: string, body: any) => { const c = RES[resource]; const { data } = await http.put('/' + c.path + '/' + id, c.toDb(body)); return c.toClient(data); },
   remove: async (resource: string, id: string) => { const c = RES[resource]; await http.delete('/' + c.path + '/' + id); },
+
+  // ── multi-company fund receipt entry (all-or-nothing) ──
+  // Every filled company row becomes its own ordinary FundReceipt. The server
+  // validates the whole batch BEFORE writing any of them, so a rejected row
+  // stores nothing. Returns the created receipts in app shape.
+  bulkCreateReceipts: async (rows: any[]) => {
+    const c = RES.receipts;
+    const { data } = await http.post('/fund-receipts/bulk', { receipts: rows.map(c.toDb) });
+    const arr = Array.isArray(data) ? data : (data?.receipts || []);
+    return arr.map(c.toClient);
+  },
+
+  // ── document attachments (Projects / Expenditures / Fund Receipts) ──
+  // `parent` is the app resource key; mapped to the backend path here so callers
+  // never hardcode a URL. Bytes live in MongoDB (no disk on the free tier).
+  listDocuments: async (parent: 'projects' | 'expenditures' | 'receipts', id: string) => {
+    const path = RES[parent].path;
+    const { data } = await http.get(`/${path}/${id}/documents`);
+    return (data || []).map((d: any) => ({
+      id: idStr(d.id ?? d._id), name: d.filename || d.name || 'document',
+      size: num(d.size), contentType: d.contentType || d.mimeType || '',
+    }));
+  },
+  // file: { uri, name, type } from the native picker.
+  uploadDocument: async (parent: 'projects' | 'expenditures' | 'receipts', id: string, file: { uri: string; name: string; type?: string }) => {
+    const path = RES[parent].path;
+    const fd = new FormData();
+    fd.append('file', { uri: file.uri, name: file.name, type: file.type || 'application/octet-stream' } as any);
+    const { data } = await http.post(`/${path}/${id}/documents`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+    return data;
+  },
+  deleteDocument: async (parent: 'projects' | 'expenditures' | 'receipts', id: string, docId: string) => {
+    const path = RES[parent].path;
+    await http.delete(`/${path}/${id}/documents/${docId}`);
+  },
+  // Fetch a document's bytes as a base64 data URL — the native download can't set
+  // an Authorization header, so we pull it through axios (which does) and hand the
+  // caller a data: URL it can pass straight to the share sheet.
+  documentDataUrl: async (parent: 'projects' | 'expenditures' | 'receipts', id: string, docId: string, contentType: string) => {
+    const path = RES[parent].path;
+    const { data } = await http.get(`/${path}/${id}/documents/${docId}/download`, { responseType: 'arraybuffer' as any });
+    const bytes = new Uint8Array(data);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    const b64 = base64Encode(binary);
+    return `data:${contentType || 'application/octet-stream'};base64,${b64}`;
+  },
+
+  // ── server-generated report files (PDF / Excel) ──
+  // The native file download can't set an Authorization header, so these endpoints
+  // additionally accept the JWT via ?token=. Returns a fully-qualified URL.
+  reportExportUrl: (kind: 'pdf' | 'excel', type: string) =>
+    `${BASE}/reports/export/${kind}?type=${encodeURIComponent(type)}${authToken ? `&token=${encodeURIComponent(authToken)}` : ''}`,
+  reportLedger: async () => { const { data } = await http.get('/reports/ledger'); return data || []; },
+  reportCarryForward: async () => { const { data } = await http.get('/reports/carry-forward'); return data || []; },
 };
