@@ -60,7 +60,25 @@ http.interceptors.response.use(
       clearToken();
       if (onUnauthorized) onUnauthorized();
     }
-    const msg = err?.response?.data?.error || err?.message || 'Network error. Check your connection.';
+    // Different backend routes shape errors differently — try every known
+    // shape before falling back, so a validation failure always shows the
+    // real reason (e.g. which field) instead of a generic "Validation failed".
+    // The Zod-backed routes return { error: 'Validation failed', details: { field: [reason] } } —
+    // `details` is what actually names the offending field, so prefer it over the generic `error`.
+    const d = err?.response?.data;
+    let msg: string | undefined;
+    if (d?.details && typeof d.details === 'object') {
+      msg = Object.entries(d.details)
+        .map(([field, reasons]: [string, any]) => `${field}: ${Array.isArray(reasons) ? reasons.join(', ') : reasons}`)
+        .join('; ');
+    }
+    if (!msg) msg = d?.error || d?.message;
+    if (!msg && d?.errors) {
+      msg = Array.isArray(d.errors)
+        ? d.errors.map((e: any) => e?.message || e?.msg || e).filter(Boolean).join('; ')
+        : Object.values(d.errors).map((e: any) => e?.message || e).filter(Boolean).join('; ');
+    }
+    msg = msg || err?.message || 'Network error. Check your connection.';
     return Promise.reject(new Error(msg));
   },
 );
@@ -136,20 +154,28 @@ const RES: Record<string, { path: string; toClient: (d: any) => any; toDb: (b: a
     path: 'projects',
     toClient: (d) => ({
       id: idStr(d.id ?? d._id), name: d.name || '',
-      // Backend records use EITHER company/financialYear OR companyId/financialYearId
-      // (the live DB has both schemas) — read whichever is present.
-      companyId: idStr(d.company ?? d.companyId), yearId: idStr(d.financialYear ?? d.financialYearId),
+      // The live schema stores companies as an ARRAY (`companyIds`) — this app's UI
+      // only supports one company per project, so read the first entry.
+      companyId: idStr(Array.isArray(d.companyIds) ? d.companyIds[0] : (d.company ?? d.companyId)),
+      yearId: idStr(d.financialYear ?? d.financialYearId),
       category: d.category || '', location: d.location || '', budget: num(d.budget),
-      status: d.status || 'active', ongoing: !!d.ongoing, description: d.description || '',
+      status: d.status || 'active',
+      // The live schema has no boolean `ongoing` — it's `derivedStatus: 'ongoing' | 'other'`.
+      ongoing: d.derivedStatus === 'ongoing' || !!d.ongoing,
+      description: d.description || '',
       startDate: typeof d.startDate === 'string' ? d.startDate.slice(0, 10) : dstr(d.startDate),
       endDate: typeof d.endDate === 'string' ? d.endDate.slice(0, 10) : dstr(d.endDate), notes: d.notes || '',
     }),
-    // Write BOTH field names so the link sticks whichever schema the backend uses.
+    // The live Project schema REQUIRES `companyIds` (non-empty array) and
+    // `derivedStatus` ('ongoing' | 'other') — it has no `companyId`/`companyId`
+    // singular or boolean `ongoing` field. Sending the old shape silently fails
+    // Zod validation (companyIds missing), so creates/edits from this app never
+    // actually saved. This app only picks one company, so wrap it in an array.
     toDb: (b) => ({
-      name: b.name, company: b.companyId, companyId: b.companyId,
-      financialYear: b.yearId, financialYearId: b.yearId,
+      name: b.name, companyIds: b.companyId ? [b.companyId] : [],
       category: b.category || '', location: b.location || '', budget: num(b.budget),
-      status: b.status || 'active', ongoing: !!b.ongoing, description: b.description || '',
+      status: b.status || 'active', derivedStatus: b.ongoing ? 'ongoing' : 'other',
+      description: b.description || '',
       startDate: b.startDate || '', endDate: b.endDate || '', notes: b.notes || '',
     }),
   },
@@ -162,8 +188,7 @@ const RES: Record<string, { path: string; toClient: (d: any) => any; toDb: (b: a
       carryForward: num(d.carryForward), amount: num(d.amount), notes: d.notes || '',
     }),
     toDb: (b) => ({
-      date: b.date || null, company: b.companyId, companyId: b.companyId,
-      financialYear: b.yearId, financialYearId: b.yearId,
+      date: b.date || null, companyId: b.companyId, financialYearId: b.yearId,
       reference: b.reference || '', mode: b.mode || 'NEFT',
       carryForward: num(b.carryForward), amount: num(b.amount), notes: b.notes || '',
     }),
@@ -177,8 +202,7 @@ const RES: Record<string, { path: string; toClient: (d: any) => any; toDb: (b: a
       description: d.description || '', reference: d.reference || '', notes: d.notes || '',
     }),
     toDb: (b) => ({
-      date: b.date || null, project: b.projectId, projectId: b.projectId,
-      company: b.companyId, companyId: b.companyId, financialYear: b.yearId, financialYearId: b.yearId,
+      date: b.date || null, projectId: b.projectId, companyId: b.companyId, financialYearId: b.yearId,
       category: b.category || '', approvedBy: b.approvedBy || '', amount: num(b.amount),
       description: b.description || '', reference: b.reference || '', notes: b.notes || '',
     }),
