@@ -90,10 +90,9 @@ Three roles: **Admin**, **Editor**, **Viewer**.
 - Project cards: category-colored accent bar, status pill (Active/Completed/On Hold/Cancelled), category chip, location, company + year + budget meta row, start→end date range ("Ongoing" if no end date), description/notes.
 - Info popup (read-only, all roles) with Status, Company, Year, Period, Description, Notes.
 - **Add/Edit Project** form: Name (required), Company (required), Financial Year (required, restricted to active years), Status, Approved Budget (₹), Category, Location, Start Date (required), End Date, **Ongoing toggle** (clears End Date), Description, Notes.
-  - Validation: required-fields alert; separate "Start date required" alert; business rule — if Status is On Hold or Cancelled, Description or Notes must explain why (enforced client-side, matches the shared backend rule).
-- **Delete Project** — blocked while status is Active ("mark it Completed before deleting"); confirmation dialog otherwise (matches a server-side delete guard).
+  - Validation: required-fields alert; separate "Start date required" alert; business rule — if Status is On Hold or Cancelled, Description or Notes must explain why.
+- **Delete Project** — blocked while status is Active ("mark it Completed before deleting"); confirmation dialog otherwise.
 - Company↔Project and Year↔Project linkage drives all derived financial calculations app-wide.
-- ⚠️ **Known drift vs. the website (2026-07-10) — see Part 2, Phase 2 for the fix plan:** the live shared schema stores a project's companies as an ARRAY (`companyIds`, multi-select on web) and has NO `financialYearId` field at all (the website's Add Project form has no Financial Year picker — end date is auto-computed server-side from whichever Financial Year the Start Date falls into, +3y if Ongoing / +1y if not, and shown as a read-only preview). This app still models Projects as single-company + a required Financial Year field the backend silently ignores, and lets the user hand-pick an End Date that the server then overwrites anyway. Data now saves correctly (the `companyId → companyIds` / `ongoing → derivedStatus` mapping in `src/api.ts` was fixed 2026-07-10), but the screen itself still needs the rework described in Part 2.
 
 ## 8. Financial Years
 
@@ -111,7 +110,6 @@ Three roles: **Admin**, **Editor**, **Viewer**.
 - **Add/Edit** form: Company (required), Financial Year (required, active years), Amount ₹ (required), Carry Forward ₹, Receipt Date (required), Payment Mode (dropdown, default NEFT), Reference Number, Notes.
 - **Delete** with confirmation.
 - Read-only info popup for all roles.
-- ⚠️ **Known drift vs. the website (2026-07-10) — see Part 2, Phase 3 for the fix plan:** the website has TWO receipt flows — "Record Receipt" (Company required) and "Receipt From Other Source" (a Master Data "Source" value like Interest/SIP/FD required instead; as of today it can ALSO optionally tag a Company, e.g. money received before its project starts). This app has no "Other Source" flow at all — every receipt implicitly requires a Company. The website also made Project optional on a receipt ("No project" is valid) with a "which of this project's companies" narrowing selector when a project has multiple companies — this app has no Project field on a receipt at all. Lastly, the website **removed "Payment Mode" from its form** (kept only for old records) and relabeled "Reference" → "Account Number" — this app still requires Payment Mode and shows "Reference Number".
 
 ## 10. Expenditures
 
@@ -121,7 +119,6 @@ Three roles: **Admin**, **Editor**, **Viewer**.
 - **Add/Edit** form: Project (required — auto-fills Company & Financial Year from the chosen project, Company field becomes locked/read-only), Financial Year (active years), Amount ₹ (required, positive), Date (required), Category, Approved By, Description, Reference Number, Notes.
 - **Delete** with confirmation.
 - Read-only info popup for all roles.
-- ⚠️ **Known drift vs. the website (2026-07-10) — see Part 2, Phase 4:** the website adds a "Carry Forward Amount (₹)" field that only appears when the picked project is Ongoing, and a read-only "Contributing Companies" reference box (how much each company has actually put into that project, from Fund Receipts). Neither exists in this app. The Company field here is locked to one project company because Projects are single-company on mobile (see Phase 2) — full parity on the "narrow to project's companies" behavior depends on that fix.
 
 ## 11. Reports
 
@@ -130,7 +127,6 @@ Mirrors the web app's Reports page — charts, tables, and PDF export.
 - Shared filters across all tabs: Company, Financial Year, From/To date range (with a "Clear dates" shortcut).
 - Segmented tabs: **Year-wise**, **Company-wise**, **Project-wise**.
 - **Export to PDF** — generates a PDF of the currently active report tab (title, filter summary, generation timestamp, styled table with totals row) and opens the native share sheet (WhatsApp/Gmail/Drive/Save to Files); shows an "Exporting…" state.
-- ⚠️ **Known drift vs. the website (2026-07-10) — see Part 2, Phase 5:** the website has TWO more tabs this app is missing — **Transaction Ledger** (flat chronological list of every receipt+expenditure with a running balance) and **Carry Forward** (unused budget on Ongoing projects, split by each company's actual contribution). The website also exports to **Excel**, not just PDF (viewers can now use both exports too, as of today). This app's chart colors are its own theme constants, not tied to any shared "received=blue/expenditure=amber" convention the website now uses everywhere.
 
 **Year-wise tab:** grouped bar chart (Received / Carry-Fwd In / Expenditure per year) + full data table with a Totals row (Financial Year, Received, Carry Fwd In, Total Available, Expenditure, Balance, Carry Fwd Out).
 
@@ -185,63 +181,9 @@ All tables/charts are horizontally scrollable for phone screens; all figures use
 - Generic CRUD engine shared across Companies, Financial Years, Projects, Fund Receipts, and Expenditures, with per-resource field-shape translation to tolerate backend schema differences (e.g. Projects store `companyIds` as an array + a derived `derivedStatus` field under the hood, translated to a simple single-company + "ongoing" toggle in the UI).
 - Defensive data coercion utilities: safe number parsing for amounts/budgets, cross-runtime-safe date parsing (guards against a Hermes-vs-Node date-parsing mismatch), and Mongo ID normalization.
 - No pagination or server-side filtering on list endpoints currently — all list/report data is fetched in full and filtered/searched client-side.
-- No file/document upload feature exists anywhere in the app currently, and no Master Data screen exists — see Part 2, Phases 1 and 6.
+- No file/document upload feature exists anywhere in the app currently.
 
 ---
 
-### Data entities at a glance (current app model — see Part 2 for the corrected shared-schema shapes)
+### Data entities at a glance
 **Companies** · **Financial Years** (multiple can be active) · **Projects** (linked to Company + Year) · **Fund Receipts** (money in, linked to Company + Year) · **Expenditures** (money out, linked to Project + Company + Year) · **Users** (Admin/Editor/Viewer) · **Activity Logs**
-
----
----
-
-# PART 2 — Gap Analysis & Phased Roadmap to Full Website Parity
-
-_Compiled 2026-07-10 by comparing this app against `CSR Manager Website` (same Render backend, same MongoDB `csr_manager` database — no backend/database work is needed for almost everything below; this is overwhelmingly a mobile-frontend rework to catch up to schema/UX changes already live on the shared API)._
-
-Phases are ordered by dependency — earlier phases unblock later ones (e.g. Master Data's Category/Source lists are consumed by Projects/Expenditures/Fund Receipts; Projects' multi-company model unblocks full parity on Fund Receipts/Expenditures narrowing).
-
-## Phase 1 — Master Data (foundational)
-**Frontend:** New "Master Data" screen, 3 tabs (Category/Status/Source), each a simple list + Add/Edit modal (single "value" text field) + delete, gated to Admin+Editor only (hidden for Viewer, matching the website's 2026-07-10 change). Add a `masterData` resource to `src/api.ts` (`GET/POST/PUT/DELETE /api/master-data`, payload `{type, value}`). Replace the free-text Category input on Projects/Expenditures, and add a Source dropdown on Fund Receipts, both sourced from this list instead of free text.
-**Backend:** None — `/api/master-data` already exists, shared, generic CRUD.
-**Database:** None — `masterdataitems` collection already seeded (Category: Education, Environment, Skill Development, Healthcare, Infrastructure, Women Empowerment, Rural Development; Status: Active, Not Active; Source: Interest, SIP, FD, Bank Deposit).
-
-## Phase 2 — Projects rework
-**Frontend:** Replace the single Company picker with a multi-select (checkbox list) writing `companyIds: string[]`. Remove the "Financial Year" field entirely (the live schema has none — it's a dead field today). Remove the manual End Date picker; replace with a read-only "auto-computed" preview (start date's Financial Year end date, +3 years if Ongoing, +1 year if not — port the website's `previewProjectEndDate` logic). Replace the `ongoing` boolean with an explicit `derivedStatus: 'ongoing'|'other'` to match the server field name/shape. Update the `Project` type in `App.tsx` accordingly.
-**Backend:** None — `computeProjectDates` middleware and Zod validation already enforce this identically for any client.
-**Database:** None.
-
-## Phase 3 — Fund Receipts rework
-**Frontend:** Add the second "Receipt From Other Source" flow (Source dropdown from Master Data, Company becomes optional instead of required). Add an optional Project field to every receipt ("No project" default), plus a "which of this project's companies" narrowing selector when the chosen project has more than one company (depends on Phase 2). Drop the "Payment Mode" field to match the website (kept only for legacy display, no longer collected). Rename "Reference Number" label to "Account Number". Update `FundReceipt` type and `src/api.ts`'s `receipts` mapping to carry `receiptType`, `source`, `projectId`.
-**Backend:** None — schema/validators already support all of this.
-**Database:** None.
-
-## Phase 4 — Expenditures enhancements
-**Frontend:** Add a "Carry Forward Amount (₹)" field, shown only when the linked project is Ongoing (real schema field `carryForwardAmount`, already exists). Add a read-only "Contributing Companies" info box once a Project is picked — sum each company's actual Fund Receipts against that project (`receiptType === 'company'` only), client-computed the same way the website does it. Full "narrow Company by project" parity depends on Phase 2 (multi-company Projects).
-**Backend:** None — `carryForwardAmount` already on the shared schema.
-**Database:** None.
-
-## Phase 5 — Reports expansion
-**Frontend:** Add two tabs — **Transaction Ledger** (flat chronological receipts+expenditures list with a running balance column) and **Carry Forward** (unused Ongoing-project budget split by each company's actual contribution — reuse the same computation as Phase 4's Contributing Companies box). Add an **Excel export** option alongside the existing PDF export (call the shared `/reports/export/excel` endpoint and share the returned file, same pattern as the current PDF share-sheet flow). Optionally align chart colors with the website's shared "received=blue / expenditure=amber" convention for visual consistency.
-**Backend:** None — Ledger/Carry Forward are computed client-side on the website too (no dedicated endpoint to port); Excel export endpoint already exists and is shared.
-**Database:** None.
-
-## Phase 6 — Document Attachments (new capability)
-**Frontend:** Add attachment UI to Project and Expenditure screens: file picker (image/PDF, capped at 5 files / 8MB each to protect the Atlas free-tier quota), thumbnail/icon list, delete (write roles only), tap-to-download. Add a "staged" pre-create flow — hold picked files locally and upload them right after the record is created (mirror the website's partial-failure messaging: "created, but N of M documents failed to upload"). Add `projectDocuments`/`expenditureDocuments` resources to `src/api.ts` (list/upload-multipart/download/delete).
-**Backend:** None — both endpoint sets already exist and are role-gated identically to what's needed (`requireWrite` for upload/delete, any role for list/download).
-**Database:** None — files are stored as `Buffer` fields directly in MongoDB (not on Render's ephemeral disk), so they already survive backend redeploys; just respect the same 8MB/file, 5-files/parent caps client-side to avoid confusing errors from the shared backend.
-
-## Phase 7 — Roles & access verification checklist
-No code gaps found here — this is a confirm-only phase:
-- ✅ Viewer can already export Reports on mobile (button has no role gate) — matches the website's 2026-07-10 change.
-- ✅ Admin Panel (stat-card breakdowns, Add User, Activity Logs with search/filter/share/clear) already at full parity with the website.
-- ✅ Dashboard and Company Detail (as a modal) already cover the same 5 sections as the website.
-- ⬜ New in Phase 1: gate the Master Data screen to Admin+Editor only once it's built.
-
-## Phase 8 — Visual/theme polish (optional, low priority)
-Native apps don't need pixel parity with a web app, so treat this phase as nice-to-have, not urgent:
-- Website's login card is now glassmorphism (translucent/blurred) with a transparent-background logo; mobile's is a solid white card with a boxed logo. Cosmetic-only fix if desired.
-- Website has a full light/dark theme toggle; mobile has one fixed theme. A mobile dark mode is a large lift (re-theming every screen's inline styles) — only take this on if there's a specific ask for it, not as part of catching up on functional parity.
-
-### Corrected data entities (shared schema, as of 2026-07-10)
-**Companies** · **Financial Years** (multiple can be active) · **Projects** (`companyIds` array, NO financial year field, `status` + `derivedStatus`) · **Fund Receipts** (`receiptType: 'company'|'other_source'`, optional `companyId`, optional `source`, optional `projectId`) · **Expenditures** (`projectId` + `companyId` + `financialYearId`, optional `carryForwardAmount`) · **Master Data** (Category/Status/Source value lists) · **Project/Expenditure Documents** (file attachments, ≤8MB/file, ≤5/parent) · **Users** (Admin/Editor/Viewer) · **Activity Logs**
