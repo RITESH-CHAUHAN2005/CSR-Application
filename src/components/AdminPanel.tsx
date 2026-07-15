@@ -7,7 +7,7 @@
 // Every figure is derived from the shared auth store (useAuth), so the moment a
 // user is created or an action is logged anywhere in the app, this screen updates.
 import React, { useMemo, useState } from 'react';
-import { Pressable, ScrollView, Share, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Alert, Pressable, ScrollView, Share, StyleSheet, Text, TextInput, View } from 'react-native';
 import { UsersThree } from 'phosphor-react-native/src/icons/UsersThree';
 import { ShieldCheck } from 'phosphor-react-native/src/icons/ShieldCheck';
 import { PencilSimple } from 'phosphor-react-native/src/icons/PencilSimple';
@@ -17,16 +17,25 @@ import { UserPlus } from 'phosphor-react-native/src/icons/UserPlus';
 import { MagnifyingGlass } from 'phosphor-react-native/src/icons/MagnifyingGlass';
 import { ShareNetwork } from 'phosphor-react-native/src/icons/ShareNetwork';
 import { Trash } from 'phosphor-react-native/src/icons/Trash';
-import { CaretLeft } from 'phosphor-react-native/src/icons/CaretLeft';
-import { CaretRight } from 'phosphor-react-native/src/icons/CaretRight';
 import { ClockCounterClockwise } from 'phosphor-react-native/src/icons/ClockCounterClockwise';
+import { Key } from 'phosphor-react-native/src/icons/Key';
+import { Lifebuoy } from 'phosphor-react-native/src/icons/Lifebuoy';
 import { theme } from '../theme';
 import {
-  ActivityLog, AppUser, Card, Confirm, Header, Modal, Pill, Role, Select, StatCard,
+  ActivityLog, AppUser, Button, Card, ChangePasswordForm, Confirm, DataTable, EmptyState, ExportButtons,
+  Header, Modal, Pill, Role, Select, StatCard, TCell,
   ROLE_LABEL, ROLE_OPTIONS, ROLE_TONE, fmtDateTime, useAuth,
 } from '../../App';
+import { api } from '../api';
 
 const PAGE = 6; // rows per page for both tables — keeps each card compact
+
+// A pending help-desk ticket (shape mirrors api.getSupportRequests()).
+type Ticket = {
+  id: string; userId: string; name: string; email: string;
+  type: 'password' | 'general'; subject: string; message: string;
+  status: string; reply: string; resolvedByEmail: string; at: string;
+};
 
 // Map a detailed action string to a coarse category for the "All Actions" filter.
 const actionCategory = (a: string): string => {
@@ -76,6 +85,60 @@ export default function AdminPanel() {
     setFormOk('Account created — the user can sign in now.');
   };
 
+  // ── Help Desk: pending SupportRequest queue ──
+  const [tickets, setTickets] = useState<Ticket[]>([]);
+  const [ticketBusy, setTicketBusy] = useState<string | null>(null); // id of the ticket being acted on
+  const [replyFor, setReplyFor] = useState<Ticket | null>(null);
+  const [replyText, setReplyText] = useState('');
+
+  const loadTickets = React.useCallback(async () => {
+    try { setTickets(await api.getSupportRequests()); }
+    catch (e: any) { Alert.alert('Help desk', e?.message || 'Could not load pending requests.'); }
+  }, []);
+  React.useEffect(() => { loadTickets(); }, [loadTickets]);
+
+  const approveTicket = async (t: Ticket) => {
+    if (ticketBusy) return;
+    setTicketBusy(t.id);
+    try {
+      const { tempPassword } = await api.approveSupportRequest(t.id);
+      Alert.alert('Password reset approved',
+        `Temporary password: ${tempPassword}\n\nShare it with the user. They'll be forced to change it on next sign-in.`);
+      setTickets(list => list.filter(x => x.id !== t.id));
+    } catch (e: any) {
+      Alert.alert('Approve failed', e?.message || 'Could not approve the request.');
+    }
+    setTicketBusy(null);
+  };
+
+  const rejectTicket = async (t: Ticket) => {
+    if (ticketBusy) return;
+    setTicketBusy(t.id);
+    try {
+      await api.rejectSupportRequest(t.id);
+      setTickets(list => list.filter(x => x.id !== t.id));
+    } catch (e: any) {
+      Alert.alert('Reject failed', e?.message || 'Could not reject the request.');
+    }
+    setTicketBusy(null);
+  };
+
+  const submitReply = async () => {
+    if (!replyFor) return;
+    const t = replyFor;
+    const reply = replyText.trim();
+    if (!reply) return;
+    setTicketBusy(t.id);
+    try {
+      await api.replySupportRequest(t.id, reply);
+      setTickets(list => list.filter(x => x.id !== t.id));
+      setReplyFor(null); setReplyText('');
+    } catch (e: any) {
+      Alert.alert('Reply failed', e?.message || 'Could not send the reply.');
+    }
+    setTicketBusy(null);
+  };
+
   // ── Counts ──
   const counts = useMemo(() => ({
     total: users.length,
@@ -100,9 +163,8 @@ export default function AdminPanel() {
     ? ALL_GROUPS.find(g => g.key === breakdownFilter)?.label || 'Users'
     : 'All Users by Role';
 
-  // ── All Users: search + pagination ──
+  // ── All Users: search (the table owns its own paging) ──
   const [uQuery, setUQuery] = useState('');
-  const [uPage, setUPage] = useState(1);
   const [confirmDel, setConfirmDel] = useState<AppUser | null>(null);
   const [confirmClearLogs, setConfirmClearLogs] = useState(false);
   const usersFiltered = useMemo(() => {
@@ -112,11 +174,10 @@ export default function AdminPanel() {
       u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q) || ROLE_LABEL[u.role].toLowerCase().includes(q));
   }, [users, uQuery]);
 
-  // ── Activity Logs: search + two filters + pagination ──
+  // ── Activity Logs: search + two filters (the table owns its own paging) ──
   const [lQuery, setLQuery] = useState('');
   const [actionF, setActionF] = useState('all');
   const [userF, setUserF] = useState('all');
-  const [lPage, setLPage] = useState(1);
 
   const actionOptions = useMemo(() => {
     const set = Array.from(new Set(logs.map(l => actionCategory(l.action))));
@@ -212,32 +273,97 @@ export default function AdminPanel() {
           </Pressable>
         </Card>
 
+        {/* Change Password — admins have no "My Dashboard", so it lives here */}
+        <Card style={{ marginTop: 14 }}>
+          <View style={styles.cardHead}>
+            <View style={styles.cardHeadIcon}><Key size={18} color={theme.primary} weight="bold" /></View>
+            <Text style={styles.cardTitle}>Change Password</Text>
+          </View>
+          <View style={{ marginTop: 6 }}>
+            <ChangePasswordForm />
+          </View>
+        </Card>
+
+        {/* Help Desk Requests — the pending SupportRequest queue */}
+        <Card style={{ marginTop: 14 }}>
+          <View style={styles.cardHead}>
+            <View style={styles.cardHeadIcon}><Lifebuoy size={18} color={theme.primary} weight="bold" /></View>
+            <Text style={styles.cardTitle}>Help Desk Requests</Text>
+            {tickets.length > 0 ? <Pill text={String(tickets.length)} tone="primary" /> : null}
+          </View>
+
+          <View style={{ marginTop: 12, gap: 12 }}>
+            {tickets.length === 0 ? (
+              <EmptyState text="No pending requests" />
+            ) : (
+              tickets.map(t => {
+                const isPwd = t.type === 'password';
+                const rowBusy = ticketBusy === t.id;
+                return (
+                  <View key={t.id} style={styles.ticket}>
+                    <View style={styles.ticketHead}>
+                      <Pill text={isPwd ? 'Password' : 'General'} tone={isPwd ? 'violet' : 'accent'} />
+                      <Text style={styles.ticketTime}>{fmtDateTime(t.at)}</Text>
+                    </View>
+                    <Text style={styles.ticketName}>{t.name || '—'}</Text>
+                    {t.email ? <Text style={styles.ticketEmail}>{t.email}</Text> : null}
+                    {t.subject ? <Text style={styles.ticketSubject}>{t.subject}</Text> : null}
+                    {t.message ? <Text style={styles.ticketMsg}>{t.message}</Text> : null}
+                    <View style={styles.ticketActions}>
+                      {isPwd ? (
+                        <>
+                          <View style={{ flex: 1 }}>
+                            <Button label={rowBusy ? 'Working…' : 'Approve'} onPress={() => approveTicket(t)} disabled={!!ticketBusy} />
+                          </View>
+                          <View style={{ flex: 1 }}>
+                            <Button label="Reject" tone="danger" onPress={() => rejectTicket(t)} disabled={!!ticketBusy} />
+                          </View>
+                        </>
+                      ) : (
+                        <View style={{ flex: 1 }}>
+                          <Button label="Reply" onPress={() => { setReplyFor(t); setReplyText(''); }} disabled={!!ticketBusy} />
+                        </View>
+                      )}
+                    </View>
+                  </View>
+                );
+              })
+            )}
+          </View>
+        </Card>
+
         {/* All Users */}
         <Card style={{ marginTop: 14, paddingHorizontal: 0 }}>
           <Text style={[styles.cardTitle, { paddingHorizontal: 16 }]}>All Users</Text>
           <View style={{ paddingHorizontal: 16, marginTop: 10 }}>
-            <SearchBox value={uQuery} onChange={t => { setUQuery(t); setUPage(1); }} placeholder="Search users…" />
+            <ExportButtons type="users" />
           </View>
-          <Table
-            cols={[{ label: 'NAME', w: 150 }, { label: 'EMAIL', w: 180 }, { label: 'ROLE', w: 90 }, { label: '', w: 56, right: true }]}
-            rows={usersFiltered}
-            page={uPage}
-            onPage={setUPage}
-            empty="No users found."
-            render={(u: AppUser) => (
-              <>
-                <Text style={[styles.td, { width: 150, fontWeight: '700', color: theme.text }]} numberOfLines={1}>{u.name}</Text>
-                <Text style={[styles.td, { width: 180 }]} numberOfLines={1}>{u.email}</Text>
-                <View style={{ width: 90 }}><Pill text={ROLE_LABEL[u.role]} tone={ROLE_TONE[u.role]} /></View>
-                <View style={{ width: 56, alignItems: 'flex-end' }}>
-                  {u.id === user?.id
+          <View style={{ paddingHorizontal: 16, marginTop: 10 }}>
+            <SearchBox value={uQuery} onChange={setUQuery} placeholder="Search users…" />
+          </View>
+          <View style={{ paddingHorizontal: 16, marginTop: 10 }}>
+            <DataTable
+              rows={usersFiltered}
+              keyFor={u => u.id}
+              empty="No users found."
+              pageSize={PAGE}
+              resetKey={uQuery}
+              columns={[
+                { label: 'NAME', width: 140, render: u => <TCell text={u.name} strong /> },
+                { label: 'EMAIL', width: 175, render: u => <TCell text={u.email} /> },
+                { label: 'ROLE', width: 95, render: u => <Pill text={ROLE_LABEL[u.role]} tone={ROLE_TONE[u.role]} /> },
+                {
+                  // You cannot delete your own account (nor the last admin — the server refuses).
+                  label: '', width: 68, right: true,
+                  render: u => (u.id === user?.id
                     ? <Text style={styles.youTag}>You</Text>
-                    : <Pressable hitSlop={8} onPress={() => setConfirmDel(u)}><Trash size={17} color={theme.danger} /></Pressable>}
-                </View>
-              </>
-            )}
-            keyFor={(u: AppUser) => u.id}
-          />
+                    : <Pressable hitSlop={8} onPress={() => setConfirmDel(u)} style={styles.rowBtn}>
+                        <Trash size={16} color={theme.danger} />
+                      </Pressable>),
+                },
+              ]}
+            />
+          </View>
         </Card>
 
         {/* Activity Logs */}
@@ -255,36 +381,42 @@ export default function AdminPanel() {
           </View>
 
           <View style={{ paddingHorizontal: 16, marginTop: 10, gap: 10 }}>
-            <SearchBox value={lQuery} onChange={t => { setLQuery(t); setLPage(1); }} placeholder="Search activity…" />
+            <ExportButtons type="activity-logs" />
+            <SearchBox value={lQuery} onChange={setLQuery} placeholder="Search activity…" />
             <View style={styles.filterRow}>
               <View style={{ flex: 1 }}>
-                <Select value={actionF} options={actionOptions} onChange={v => { setActionF(v); setLPage(1); }} />
+                <Select value={actionF} options={actionOptions} onChange={setActionF} />
               </View>
               <View style={{ flex: 1 }}>
-                <Select value={userF} options={userOptions} onChange={v => { setUserF(v); setLPage(1); }} />
+                <Select value={userF} options={userOptions} onChange={setUserF} />
               </View>
             </View>
           </View>
 
-          <Table
-            cols={[{ label: 'WHEN', w: 150 }, { label: 'USER', w: 170 }, { label: 'ROLE', w: 80 }, { label: 'ACTIVITY', w: 220 }, { label: '', w: 44, right: true }]}
-            rows={logsFiltered}
-            page={lPage}
-            onPage={setLPage}
-            empty="No activity yet."
-            render={(l: ActivityLog) => (
-              <>
-                <Text style={[styles.td, { width: 150 }]} numberOfLines={1}>{fmtDateTime(l.at)}</Text>
-                <Text style={[styles.td, { width: 170, color: theme.text, fontWeight: '600' }]} numberOfLines={1}>{l.userEmail}</Text>
-                <Text style={[styles.td, { width: 80 }]} numberOfLines={1}>{l.role ? ROLE_LABEL[l.role] : '—'}</Text>
-                <Text style={[styles.td, { width: 220, color: theme.text }]} numberOfLines={1}>{l.action}</Text>
-                <View style={{ width: 44, alignItems: 'flex-end' }}>
-                  <Pressable hitSlop={8} onPress={() => shareLog(l)}><ShareNetwork size={17} color={theme.primary} /></Pressable>
-                </View>
-              </>
-            )}
-            keyFor={(l: ActivityLog) => l.id}
-          />
+          <View style={{ paddingHorizontal: 16, marginTop: 10 }}>
+            <DataTable
+              rows={logsFiltered}
+              keyFor={l => l.id}
+              empty="No activity yet."
+              pageSize={PAGE}
+              resetKey={`${lQuery}|${actionF}|${userF}`}
+              columns={[
+                { label: 'WHEN', width: 145, render: l => <TCell text={fmtDateTime(l.at)} /> },
+                { label: 'USER', width: 165, render: l => <TCell text={l.userEmail} strong /> },
+                { label: 'ROLE', width: 85, render: l => <TCell text={l.role ? ROLE_LABEL[l.role] : '—'} /> },
+                // Two lines: an activity line like 'Updated Project "…"' is long.
+                { label: 'ACTIVITY', width: 210, render: l => <TCell text={l.action} strong lines={2} /> },
+                {
+                  label: '', width: 60, right: true,
+                  render: l => (
+                    <Pressable hitSlop={8} onPress={() => shareLog(l)} style={styles.rowBtn}>
+                      <ShareNetwork size={16} color={theme.primary} />
+                    </Pressable>
+                  ),
+                },
+              ]}
+            />
+          </View>
         </Card>
       </ScrollView>
 
@@ -304,6 +436,7 @@ export default function AdminPanel() {
         onConfirm={() => { clearLogs(); setConfirmClearLogs(false); }}
       />
 
+      {/* Tapping a count card opens this breakdown; tapping outside it closes it. */}
       <Modal visible={!!breakdownFilter} title={breakdownTitle} onClose={() => setBreakdownFilter(null)}>
         {breakdownGroups.map(g => {
           const list = users.filter(u => u.role === g.key);
@@ -313,20 +446,54 @@ export default function AdminPanel() {
                 <Text style={styles.bdGroupTitle}>{g.label}</Text>
                 <Pill text={String(list.length)} tone={ROLE_TONE[g.key]} />
               </View>
-              {list.length === 0
-                ? <Text style={styles.bdEmpty}>No {g.label.toLowerCase()} yet.</Text>
-                : list.map(u => (
-                    <View key={u.id} style={styles.bdUserRow}>
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.bdUserName} numberOfLines={1}>{u.name}</Text>
-                        <Text style={styles.bdUserEmail} numberOfLines={1}>{u.email}</Text>
+              {list.length === 0 ? (
+                <Text style={styles.bdEmpty}>No {g.label.toLowerCase()} yet.</Text>
+              ) : (
+                <>
+                  <View style={[styles.tRow, styles.tHeadRow]}>
+                    <Text style={[styles.th, { flex: 1 }]}>NAME</Text>
+                    <Text style={[styles.th, { flex: 1.2 }]}>EMAIL</Text>
+                    <Text style={[styles.th, { width: 40, textAlign: 'right' }]} />
+                  </View>
+                  {list.map(u => (
+                    <View key={u.id} style={styles.tRow}>
+                      <Text style={[styles.td, { flex: 1, color: theme.text, fontWeight: '700' }]} numberOfLines={1}>{u.name}</Text>
+                      <Text style={[styles.td, { flex: 1.2 }]} numberOfLines={1}>{u.email}</Text>
+                      <View style={{ width: 40, alignItems: 'flex-end' }}>
+                        {u.id === user?.id && <Text style={styles.youTag}>You</Text>}
                       </View>
-                      {u.id === user?.id && <Text style={styles.youTag}>You</Text>}
                     </View>
                   ))}
+                </>
+              )}
             </View>
           );
         })}
+      </Modal>
+
+      {/* Reply to a general help-desk ticket (marks it resolved on submit). */}
+      <Modal visible={!!replyFor} title="Reply to request" onClose={() => { setReplyFor(null); setReplyText(''); }}>
+        {replyFor ? (
+          <>
+            {replyFor.subject ? <Text style={styles.replySubject}>{replyFor.subject}</Text> : null}
+            {replyFor.message ? <Text style={styles.replyMsg}>{replyFor.message}</Text> : null}
+            <Text style={styles.fLabel}>YOUR REPLY</Text>
+            <TextInput
+              value={replyText}
+              onChangeText={setReplyText}
+              placeholder="Type a reply to the user…"
+              placeholderTextColor={theme.faint}
+              multiline
+              style={[styles.input, styles.replyInput]}
+            />
+            <View style={styles.replyActions}>
+              {ticketBusy === replyFor.id ? <ActivityIndicator size="small" color={theme.primary} /> : null}
+              <View style={{ flex: 1 }}>
+                <Button label="Send Reply" onPress={submitReply} disabled={!replyText.trim() || !!ticketBusy} />
+              </View>
+            </View>
+          </>
+        ) : null}
       </Modal>
     </View>
   );
@@ -340,54 +507,6 @@ function SearchBox({ value, onChange, placeholder }: { value: string; onChange: 
       <TextInput value={value} onChangeText={onChange} placeholder={placeholder}
         placeholderTextColor={theme.faint} style={styles.searchInput} autoCapitalize="none" autoCorrect={false} />
     </View>
-  );
-}
-
-// ── Generic horizontally-scrolling, paginated table ──
-type Col = { label: string; w: number; right?: boolean };
-function Table<T>({ cols, rows, page, onPage, render, keyFor, empty }: {
-  cols: Col[]; rows: T[]; page: number; onPage: (p: number) => void;
-  render: (row: T) => React.ReactNode; keyFor: (row: T) => string; empty: string;
-}) {
-  const total = rows.length;
-  const pages = Math.max(1, Math.ceil(total / PAGE));
-  const safe = Math.min(page, pages);
-  const from = total === 0 ? 0 : (safe - 1) * PAGE + 1;
-  const to = Math.min(safe * PAGE, total);
-  const slice = rows.slice((safe - 1) * PAGE, safe * PAGE);
-
-  return (
-    <>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 16, marginTop: 8 }}>
-        <View>
-          <View style={[styles.tRow, styles.tHeadRow]}>
-            {cols.map((c, i) => (
-              <Text key={i} style={[styles.th, { width: c.w }, c.right && { textAlign: 'right' }]} numberOfLines={1}>{c.label}</Text>
-            ))}
-          </View>
-          {slice.length === 0
-            ? <Text style={styles.tEmpty}>{empty}</Text>
-            : slice.map(row => (
-                <View key={keyFor(row)} style={styles.tRow}>{render(row)}</View>
-              ))}
-        </View>
-      </ScrollView>
-
-      <View style={styles.pager}>
-        <Text style={styles.pagerText}>Showing {from}–{to} of {total}</Text>
-        <View style={styles.pagerBtns}>
-          <Pressable disabled={safe <= 1} hitSlop={6} onPress={() => onPage(safe - 1)}
-            style={[styles.pagerBtn, safe <= 1 && styles.pagerOff]}>
-            <CaretLeft size={15} color={safe <= 1 ? theme.faint : theme.text} weight="bold" />
-          </Pressable>
-          <View style={styles.pagerNum}><Text style={styles.pagerNumText}>{safe}</Text></View>
-          <Pressable disabled={safe >= pages} hitSlop={6} onPress={() => onPage(safe + 1)}
-            style={[styles.pagerBtn, safe >= pages && styles.pagerOff]}>
-            <CaretRight size={15} color={safe >= pages ? theme.faint : theme.text} weight="bold" />
-          </Pressable>
-        </View>
-      </View>
-    </>
   );
 }
 
@@ -434,19 +553,8 @@ const styles = StyleSheet.create({
   tHeadRow: { borderBottomWidth: 1.5 },
   th: { fontSize: 11, color: theme.faint, fontWeight: '700', letterSpacing: 0.3 },
   td: { fontSize: 12.5, color: theme.muted, fontWeight: '600' },
-  tEmpty: { fontSize: 13, color: theme.faint, fontStyle: 'italic', paddingVertical: 22 },
   youTag: { fontSize: 11.5, color: theme.faint, fontWeight: '700' },
-
-  pager: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingHorizontal: 16, paddingTop: 12, marginTop: 2,
-  },
-  pagerText: { fontSize: 12, color: theme.muted, fontWeight: '600' },
-  pagerBtns: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  pagerBtn: { width: 30, height: 30, borderRadius: 9, borderWidth: 1, borderColor: theme.border, alignItems: 'center', justifyContent: 'center', backgroundColor: '#fff' },
-  pagerOff: { backgroundColor: '#f7f8fd' },
-  pagerNum: { minWidth: 30, height: 30, borderRadius: 9, backgroundColor: theme.primary, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6 },
-  pagerNumText: { color: '#fff', fontWeight: '800', fontSize: 13 },
+  rowBtn: { width: 30, height: 30, borderRadius: 9, backgroundColor: '#f3f4fb', alignItems: 'center', justifyContent: 'center' },
 
   clearBtn: {
     flexDirection: 'row', alignItems: 'center', gap: 5,
@@ -454,15 +562,25 @@ const styles = StyleSheet.create({
   },
   clearBtnText: { color: theme.danger, fontWeight: '700', fontSize: 12 },
 
+  // Help Desk tickets
+  ticket: { borderWidth: 1, borderColor: theme.border, borderRadius: 12, padding: 13, backgroundColor: '#f7f8fd' },
+  ticketHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
+  ticketTime: { fontSize: 11.5, color: theme.faint, fontWeight: '600' },
+  ticketName: { fontSize: 14, fontWeight: '800', color: theme.text },
+  ticketEmail: { fontSize: 12.5, color: theme.muted, fontWeight: '600', marginTop: 1 },
+  ticketSubject: { fontSize: 13.5, fontWeight: '700', color: theme.text, marginTop: 8 },
+  ticketMsg: { fontSize: 13, color: theme.muted, fontWeight: '500', marginTop: 4, lineHeight: 18 },
+  ticketActions: { flexDirection: 'row', gap: 10, marginTop: 12 },
+
+  // Reply modal
+  replySubject: { fontSize: 14, fontWeight: '800', color: theme.text },
+  replyMsg: { fontSize: 13, color: theme.muted, fontWeight: '500', marginTop: 4, lineHeight: 18 },
+  replyInput: { minHeight: 96, textAlignVertical: 'top', paddingTop: 12 },
+  replyActions: { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 14 },
+
   // Total Users breakdown popup
   bdGroup: { marginBottom: 18 },
   bdGroupHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
   bdGroupTitle: { fontSize: 14.5, fontWeight: '800', color: theme.text },
   bdEmpty: { fontSize: 12.5, color: theme.faint, fontStyle: 'italic', paddingVertical: 6 },
-  bdUserRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 9,
-    borderBottomWidth: 1, borderBottomColor: theme.border,
-  },
-  bdUserName: { fontSize: 13.5, fontWeight: '700', color: theme.text },
-  bdUserEmail: { fontSize: 12, color: theme.muted, marginTop: 1 },
 });

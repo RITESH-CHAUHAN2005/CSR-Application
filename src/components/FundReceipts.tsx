@@ -1,22 +1,26 @@
-// Screen 5 — Fund Receipts: donor money received. Two entry modes — a normal
-// "Record Receipt" (receiptType 'company') and "Receipt From Other Source"
-// (income earned on a company's funds). Company/year filters + search, cards,
-// add/edit/delete. When a company receipt is booked against a project, the form
-// switches to a per-company grid and each filled row becomes its own receipt
-// (bulk, all-or-nothing). Mirrors the web app's Fund Receipts screen.
+// Screen 5 — Fund Receipts: donor money received. Two entry modes:
+//   • "Record Receipt"            → receiptType 'company'      (a donor's contribution)
+//   • "Receipt From Other Source" → receiptType 'other_source' (income EARNED on that
+//                                    company's funds — Interest, SIP, FD…)
+// A company is required for BOTH — money always arrives on behalf of some company.
+// An other_source receipt is NOT a contribution: it never counts toward a project's
+// "Received", though it does count toward that company's overall total.
+//
+// Booking a company receipt against a project switches the form to a per-company
+// grid; each filled row becomes its own ordinary FundReceipt (bulk, all-or-nothing).
+//
+// Payment Mode and Carry Forward are LEGACY columns — never collected here, never
+// sent, and no report reads them.
 import React, { useMemo, useState } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { MagnifyingGlass } from 'phosphor-react-native/src/icons/MagnifyingGlass';
-import { PencilSimple } from 'phosphor-react-native/src/icons/PencilSimple';
-import { Trash } from 'phosphor-react-native/src/icons/Trash';
-import { Receipt } from 'phosphor-react-native/src/icons/Receipt';
 import { Plus } from 'phosphor-react-native/src/icons/Plus';
 import { theme } from '../theme';
-import type { PaymentMode } from '../theme';
+import Attachments, { StagedFile, uploadStaged } from './Attachments';
 import {
-  Button, Card, Company, Confirm, DatePicker, EmptyState, Field, FinancialYear,
-  FundReceipt, Header, InfoButton, InfoModal, Input, MasterDataItem, Modal, Pill,
-  Project, Select, fmtNice, inr, useAuth,
+  Button, CodeBadge, Company, Confirm, DataTable, DatePicker, ExportButtons, Field, FinancialYear,
+  FundReceipt, Header, InfoModal, Input, MasterDataItem, Modal,
+  Project, RowActions, Select, TCell, fmtNice, inr, projectLabel, todayISO, useAuth,
 } from '../../App';
 
 type ReceiptType = FundReceipt['receiptType'];
@@ -27,27 +31,20 @@ type Props = {
   years: FinancialYear[];
   projects: Project[];
   masterData: MasterDataItem[];
-  add: (r: Omit<FundReceipt, 'id'>) => void;
+  add: (r: Omit<FundReceipt, 'id'>) => Promise<string | null>;
   update: (id: string, r: Omit<FundReceipt, 'id'>) => void;
   remove: (id: string) => void;
-  bulkAdd: (rows: Omit<FundReceipt, 'id'>[]) => void;
+  bulkAdd: (rows: Omit<FundReceipt, 'id'>[]) => Promise<string[] | null>;
 };
-
-// Legacy fields are never collected on the form — new records default them.
-const NEFT: PaymentMode = 'NEFT';
 
 const blank = {
   receiptType: 'company' as ReceiptType,
   companyId: '', source: '', projectId: '', yearId: '',
-  date: '', amount: '', reference: '', notes: '',
+  date: '', amount: '', reference: '', description: '',
 };
 
 // Grid cell keyed by companyId — a per-company account number + amount.
 type GridCell = { reference: string; amount: string };
-
-// Local ISO (yyyy-mm-dd) for "not in the future" checks — compared as a string.
-const pad = (n: number) => String(n).padStart(2, '0');
-const localISO = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 
 export default function FundReceipts({
   receipts, companies, years, projects, masterData, add, update, remove, bulkAdd,
@@ -60,6 +57,8 @@ export default function FundReceipts({
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState(blank);
   const [grid, setGrid] = useState<Record<string, GridCell>>({});
+  const [staged, setStaged] = useState<StagedFile[]>([]);
+  const [saving, setSaving] = useState(false);
   const [delId, setDelId] = useState<string | null>(null);
   const [info, setInfo] = useState<FundReceipt | null>(null);
 
@@ -67,14 +66,17 @@ export default function FundReceipts({
 
   const companyName = (id: string) => companies.find(c => c.id === id)?.name ?? '—';
   const yearName = (id: string) => years.find(y => y.id === id)?.name ?? '—';
-  const projectName = (id: string) => (id ? (projects.find(p => p.id === id)?.name ?? '—') : '—');
-  // A card's headline: the donor company, or the source for an other-source receipt.
+  const project = (id: string) => projects.find(p => p.id === id);
+  const projectName = (id: string) => (id ? (project(id)?.name ?? '—') : '—');
+  const projectCode = (id: string) => (id ? (project(id)?.projectCode ?? '') : '');
+  // A row's headline: the donor company, or the source for an other-source receipt.
   const receiptTitle = (r: FundReceipt) => (r.receiptType === 'other_source' ? (r.source || 'Other Source') : companyName(r.companyId));
 
-  const todayISO = localISO(new Date());
+  const today = todayISO();
 
-  // Record form's Financial Year dropdown only offers ACTIVE years (current
-  // value kept when editing a record on a now-inactive year).
+  // The Financial Year dropdown only offers ACTIVE years — the server rejects a
+  // new receipt booked against an inactive one. When EDITING a record whose year
+  // has since gone inactive, that year stays selectable so old data isn't corrupted.
   const activeYears = years.filter(y => y.active);
   const formYearOpts = (currentId: string) => {
     const opts = activeYears.map(y => ({ label: y.name, value: y.id }));
@@ -96,9 +98,10 @@ export default function FundReceipts({
       (companyFilter === 'all' || r.companyId === companyFilter) &&
       (yearFilter === 'all' || r.yearId === yearFilter) &&
       (!s || [
-        companies.find(c => c.id === r.companyId)?.name ?? '',
-        r.source, r.reference, projects.find(p => p.id === r.projectId)?.name ?? '',
-      ].some(t => t.toLowerCase().includes(s))));
+        companyName(r.companyId), r.source, r.reference, r.description,
+        projectCode(r.projectId), projectName(r.projectId),
+      ].some(t => (t || '').toLowerCase().includes(s))));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receipts, companyFilter, yearFilter, q, companies, projects]);
 
   const total = useMemo(() => filtered.reduce((sum, r) => sum + r.amount, 0), [filtered]);
@@ -107,7 +110,8 @@ export default function FundReceipts({
   const openAdd = (receiptType: ReceiptType) => {
     setEditing(null);
     setGrid({});
-    setForm({ ...blank, receiptType, yearId: activeYears[0]?.id ?? years[0]?.id ?? '' });
+    setStaged([]);
+    setForm({ ...blank, receiptType, yearId: activeYears[0]?.id ?? '' });
     setShowForm(true);
   };
   const openEdit = (r: FundReceipt) => {
@@ -115,18 +119,20 @@ export default function FundReceipts({
     // the per-company grid — we reuse the single form with the record's type.
     setEditing(r);
     setGrid({});
+    setStaged([]);
     setForm({
       receiptType: r.receiptType, companyId: r.companyId, source: r.source,
       projectId: r.projectId, yearId: r.yearId, date: r.date,
-      amount: String(r.amount), reference: r.reference, notes: r.notes,
+      amount: String(r.amount), reference: r.reference, description: r.description,
     });
     setShowForm(true);
   };
 
   // Grid mode: a NEW company receipt with a project selected → one row per
-  // company funding that project. Editing always stays single-record.
+  // company funding that project, each banking from its own account. Editing
+  // always stays single-record.
   const gridMode = !editing && form.receiptType === 'company' && !!form.projectId;
-  const gridProject = projects.find(p => p.id === form.projectId);
+  const gridProject = project(form.projectId);
   const gridCompanies = gridProject
     ? gridProject.companyIds.map(id => companies.find(c => c.id === id)).filter((c): c is Company => !!c)
     : [];
@@ -138,9 +144,9 @@ export default function FundReceipts({
   // Changing the project resets the grid so amounts never carry across projects.
   const onProjectChange = (v: string) => { set('projectId', v); setGrid({}); };
 
-  const save = () => {
+  const save = async () => {
     if (!form.date) { Alert.alert('Missing details', 'Receipt Date is required.'); return; }
-    if (form.date > todayISO) { Alert.alert('Invalid date', 'Receipt Date cannot be in the future.'); return; }
+    if (form.date > today) { Alert.alert('Invalid date', 'Receipt Date cannot be in the future.'); return; }
     if (!form.yearId) { Alert.alert('Missing details', 'Financial Year is required.'); return; }
 
     if (gridMode) {
@@ -153,7 +159,7 @@ export default function FundReceipts({
           rows.push({
             date: form.date.trim(), receiptType: 'company', companyId: c.id, source: '',
             projectId: form.projectId, yearId: form.yearId, reference: cell.reference.trim(),
-            amount: amt, notes: form.notes.trim(), mode: NEFT, carryForward: 0,
+            amount: amt, description: form.description.trim(),
           });
         }
       }
@@ -161,8 +167,16 @@ export default function FundReceipts({
         Alert.alert('Nothing to record', 'Enter an amount for at least one company.');
         return;
       }
-      bulkAdd(rows);
+      setSaving(true);
+      const ids = await bulkAdd(rows);
+      setSaving(false);
+      if (!ids || !ids.length) return;        // batch rejected — keep the form open
       setShowForm(false);
+      // Each staged proof is attached to EVERY receipt the entry created.
+      for (const id of ids) {
+        if (staged.length) await uploadStaged('receipts', id, staged);
+      }
+      setStaged([]);
       return;
     }
 
@@ -179,19 +193,32 @@ export default function FundReceipts({
       date: form.date.trim(), receiptType: form.receiptType, companyId: form.companyId,
       source: form.receiptType === 'other_source' ? form.source.trim() : '',
       projectId: form.projectId, yearId: form.yearId, reference: form.reference.trim(),
-      amount: Number(form.amount) || 0, notes: form.notes.trim(),
-      // Legacy fields: preserve when editing, default for new records.
-      mode: editing ? editing.mode : NEFT,
-      carryForward: editing ? editing.carryForward : 0,
+      amount: Number(form.amount) || 0, description: form.description.trim(),
     };
-    if (editing) update(editing.id, payload); else add(payload);
+    if (editing) {
+      // Proof on an existing receipt uploads as soon as it's picked.
+      update(editing.id, payload);
+      setShowForm(false);
+      return;
+    }
+    setSaving(true);
+    const newId = await add(payload);
+    setSaving(false);
+    if (!newId) return;                       // create failed — keep the form open
     setShowForm(false);
+    if (staged.length) await uploadStaged('receipts', newId, staged);
+    setStaged([]);
   };
 
   const companyOpts = [{ label: 'All Companies', value: 'all' }, ...companies.map(c => ({ label: c.name, value: c.id }))];
   const yearOpts = [{ label: 'All Years', value: 'all' }, ...years.map(y => ({ label: y.name, value: y.id }))];
+  // A company is REQUIRED for both receipt types — there is no "no company" option.
   const formCompanyOpts = companies.map(c => ({ label: c.name, value: c.id }));
-  const projectOpts = [{ label: '— No project —', value: '' }, ...projects.map(p => ({ label: p.name, value: p.id }))];
+  // A project is picked as "RURA2025 — Rural Uplift", the way it's named everywhere.
+  const projectOpts = [
+    { label: '— No project —', value: '' },
+    ...projects.map(p => ({ label: projectLabel(p), value: p.id })),
+  ];
 
   const formTitle = editing
     ? 'Edit Fund Receipt'
@@ -218,51 +245,33 @@ export default function FundReceipts({
         </View>
         <View style={styles.search}>
           <MagnifyingGlass size={18} color={theme.faint} />
-          <Input value={q} onChangeText={setQ} placeholder="Search receipts…" style={styles.searchInput} />
+          <Input value={q} onChangeText={setQ} placeholder="Search Project ID, company, source, account…" style={styles.searchInput} />
         </View>
 
-        {filtered.length === 0 && <EmptyState text="No fund receipts match your filters." />}
+        <ExportButtons type="fund-receipts" />
 
-        {filtered.map(r => (
-          <Card key={r.id} style={styles.card}>
-            <View style={styles.topRow}>
-              <View style={styles.chip}>
-                <Receipt size={22} color={theme.success} weight="fill" />
-              </View>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.name} numberOfLines={1}>{receiptTitle(r)}</Text>
-                <Text style={styles.date}>{fmtNice(r.date) || '—'}</Text>
-              </View>
-              <Text style={styles.amount}>{inr(r.amount)}</Text>
-              <InfoButton onPress={() => setInfo(r)} />
-            </View>
-
-            <View style={styles.metaRow}>
-              <Meta label="Account Number" value={r.reference || '—'} />
-              <Pill text={r.receiptType === 'other_source' ? 'Other Source' : 'Company'} tone={r.receiptType === 'other_source' ? 'violet' : 'primary'} />
-            </View>
-
-            <View style={styles.metaRow}>
-              <Meta label="Project" value={projectName(r.projectId)} />
-              <Meta label="Year" value={yearName(r.yearId)} right />
-            </View>
-
-            {!!r.notes && <Text style={styles.notes}>Note: {r.notes}</Text>}
-
-            {canEdit && (
-              <View style={styles.actions}>
-                <Pressable style={styles.action} onPress={() => openEdit(r)} hitSlop={6}>
-                  <PencilSimple size={16} color={theme.primary} />
-                  <Text style={[styles.actionText, { color: theme.primary }]}>Edit</Text>
-                </Pressable>
-                <Pressable style={styles.action} onPress={() => setDelId(r.id)} hitSlop={6}>
-                  <Trash size={16} color={theme.danger} />
-                  <Text style={[styles.actionText, { color: theme.danger }]}>Delete</Text>
-                </Pressable>
-              </View>
-            )}
-          </Card>
-        ))}
+        {/* List columns (§5.5): Date · Donor/Source · Year · Project ID · Project ·
+            Account Number · Amount. Tap a row for the full record. */}
+        <DataTable
+          rows={filtered}
+          keyFor={r => r.id}
+          empty="No fund receipts match your filters."
+          onRowPress={r => setInfo(r)}
+          resetKey={`${companyFilter}|${yearFilter}|${q}`}
+          columns={[
+            { label: 'DATE', width: 88, render: r => <TCell text={fmtNice(r.date) || '—'} strong /> },
+            { label: 'DONOR / SOURCE', width: 130, render: r => <TCell text={receiptTitle(r)} /> },
+            { label: 'YEAR', width: 88, render: r => <TCell text={yearName(r.yearId)} /> },
+            { label: 'PROJECT ID', width: 100, render: r => (r.projectId ? <CodeBadge code={projectCode(r.projectId)} /> : <TCell text="—" />) },
+            { label: 'PROJECT', width: 130, render: r => <TCell text={r.projectId ? projectName(r.projectId) : '—'} /> },
+            { label: 'ACCOUNT NUMBER', width: 130, render: r => <TCell text={r.reference || '—'} /> },
+            { label: 'AMOUNT', width: 105, right: true, render: r => <TCell text={inr(r.amount)} right color={theme.success} strong /> },
+            ...(canEdit ? [{
+              label: '', width: 90, right: true,
+              render: (r: FundReceipt) => <RowActions onEdit={() => openEdit(r)} onDelete={() => setDelId(r.id)} />,
+            }] : []),
+          ]}
+        />
       </ScrollView>
 
       {canEdit && (
@@ -270,9 +279,19 @@ export default function FundReceipts({
           {/* Shared header fields — entered once, even for the grid. */}
           <View style={styles.formRow}>
             <View style={{ flex: 1 }}><Field label="Financial Year *"><Select value={form.yearId} options={formYearOpts(form.yearId)} onChange={v => set('yearId', v)} placeholder="Select year" /></Field></View>
-            <View style={{ flex: 1 }}><Field label="Receipt Date *"><DatePicker value={form.date} onChange={v => set('date', v)} placeholder="Receipt date" /></Field></View>
+            <View style={{ flex: 1 }}>
+              <Field label="Receipt Date *">
+                {/* Never in the future — the server rejects it regardless. */}
+                <DatePicker value={form.date} onChange={v => set('date', v)} placeholder="Receipt date" maxDate={today} />
+              </Field>
+            </View>
           </View>
           <Field label="Project"><Select value={form.projectId} options={projectOpts} onChange={onProjectChange} placeholder="— No project —" /></Field>
+          {!form.projectId && (
+            <Text style={styles.projectHint}>
+              A receipt has to name a project for that project's carry forward to be computable.
+            </Text>
+          )}
 
           {form.receiptType === 'other_source' && (
             <Field label="Source *">
@@ -283,7 +302,9 @@ export default function FundReceipts({
           )}
 
           {gridMode ? (
-            // Per-company grid: one row per funding company. Blank/zero rows skip.
+            // Per-company grid: one row per funding company, each with its OWN
+            // account number (companies do not share one). Blank/zero rows skip.
+            // The batch is all-or-nothing: if any row fails, nothing is written.
             <View style={styles.grid}>
               <View style={styles.gridHeadRow}>
                 <Text style={[styles.gridHeadCell, styles.gridCompanyCol]}>COMPANY</Text>
@@ -323,8 +344,25 @@ export default function FundReceipts({
             </>
           )}
 
-          <Field label="Notes"><Input value={form.notes} onChangeText={t => set('notes', t)} placeholder="Additional notes…" multiline /></Field>
-          <Button label={editing ? 'Save Changes' : 'Record'} onPress={save} />
+          <Field label="Description"><Input value={form.description} onChangeText={t => set('description', t)} placeholder="Anything worth recording about this receipt" multiline /></Field>
+
+          {/* Proof documents — any type, any number, 15 MB each. On a grid entry
+              each staged file is attached to EVERY receipt the entry creates. */}
+          <Field label="Attach Proof">
+            <Attachments
+              parent="receipts"
+              recordId={editing?.id ?? null}
+              staged={staged}
+              onStagedChange={setStaged}
+              canEdit={canEdit}
+            />
+          </Field>
+
+          <Button
+            label={saving ? 'Saving…' : editing ? 'Save Changes' : 'Record'}
+            onPress={save}
+            disabled={saving}
+          />
         </Modal>
       )}
 
@@ -348,12 +386,12 @@ export default function FundReceipts({
           { label: 'Type', value: info.receiptType === 'other_source' ? 'Other Source' : 'Company' },
           { label: 'Company', value: companyName(info.companyId) },
           ...(info.receiptType === 'other_source' ? [{ label: 'Source', value: info.source || '—' }] : []),
-          { label: 'Project', value: projectName(info.projectId) },
+          { label: 'Project', value: info.projectId ? projectLabel(project(info.projectId)) : '—' },
           { label: 'Financial Year', value: yearName(info.yearId) },
           { label: 'Account Number', value: info.reference || '—' },
           { label: 'Amount', value: inr(info.amount) },
         ] : undefined}
-        notes={info?.notes}
+        description={info?.description}
       />
     </View>
   );
@@ -367,13 +405,6 @@ const EntryPill = ({ label, onPress }: { label: string; onPress: () => void }) =
     <Plus size={15} color={theme.primary} weight="bold" />
     <Text style={styles.entryPillText}>{label}</Text>
   </Pressable>
-);
-
-const Meta = ({ label, value, right }: { label: string; value: string; right?: boolean }) => (
-  <View style={[styles.meta, right && { alignItems: 'flex-end' }]}>
-    <Text style={styles.metaLabel}>{label.toUpperCase()}</Text>
-    <Text style={styles.metaValue} numberOfLines={1}>{value}</Text>
-  </View>
 );
 
 const styles = StyleSheet.create({
@@ -390,23 +421,8 @@ const styles = StyleSheet.create({
   search: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', borderRadius: 14, paddingLeft: 14, borderWidth: 1, borderColor: theme.border },
   searchInput: { flex: 1, borderWidth: 0, backgroundColor: 'transparent', minHeight: 48 },
 
-  card: {},
-  topRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  chip: { width: 46, height: 46, borderRadius: 13, backgroundColor: theme.successSoft, alignItems: 'center', justifyContent: 'center' },
-  name: { fontSize: 15, fontWeight: '700', color: theme.text },
-  date: { fontSize: 12, color: theme.faint, marginTop: 3, fontWeight: '500' },
-  amount: { fontSize: 16, fontWeight: '800', color: theme.success },
-
-  metaRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginTop: 12 },
-  meta: { flex: 1 },
-  metaLabel: { fontSize: 9.5, color: theme.faint, fontWeight: '700', letterSpacing: 0.5 },
-  metaValue: { fontSize: 13, color: theme.text, fontWeight: '600', marginTop: 3 },
-  notes: { fontSize: 12, color: theme.faint, fontStyle: 'italic', marginTop: 10, lineHeight: 17 },
-
   formRow: { flexDirection: 'row', gap: 10 },
-  actions: { flexDirection: 'row', justifyContent: 'flex-end', gap: 18, marginTop: 14 },
-  action: { flexDirection: 'row', alignItems: 'center', gap: 5 },
-  actionText: { fontSize: 13.5, fontWeight: '700' },
+  projectHint: { fontSize: 11.5, color: theme.faint, fontWeight: '500', lineHeight: 16, marginTop: -8, marginBottom: 14 },
 
   // Per-company grid (multi-company receipt entry).
   grid: { marginTop: 4, marginBottom: 14, borderWidth: 1, borderColor: theme.border, borderRadius: 12, overflow: 'hidden' },

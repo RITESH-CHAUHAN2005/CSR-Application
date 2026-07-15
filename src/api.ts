@@ -78,6 +78,9 @@ http.interceptors.response.use(
         ? d.errors.map((e: any) => e?.message || e?.msg || e).filter(Boolean).join('; ')
         : Object.values(d.errors).map((e: any) => e?.message || e).filter(Boolean).join('; ');
     }
+    // A 413 is the server rejecting an oversized attachment. The body is often
+    // empty on that status, so name the real limit rather than showing nothing.
+    if (!msg && status === 413) msg = 'That file is too large — the maximum is 15 MB per file.';
     if (!msg) msg = err?.response ? err?.message : 'Could not reach the server. Check your connection.';
     return Promise.reject(new Error(msg));
   },
@@ -127,7 +130,25 @@ const dstr = (v: any) => {
 const mapUser = (u: any) => ({
   id: idStr(u?.id ?? u?._id), name: u?.name || '', email: u?.email || '',
   role: u?.role || 'viewer', company: u?.company || '',
+  // Kept in API responses (unlike passwordHash) — true after an admin approves a
+  // password-reset (the account is now on the temp password <firstname>@apl123).
+  // The client reads it to force a password change before letting the user in.
+  mustChangePassword: !!u?.mustChangePassword,
 }); // note: never carry the backend's `password` hash into the app
+
+// ── support requests (the help desk — replaces the old PasswordResetRequest) ──
+// `type: 'password'` = a "forgot my password" ticket an admin approves/rejects;
+// `type: 'general'` = a free-text help message an admin replies to.
+const mapSupport = (s: any) => ({
+  id: idStr(s?.id ?? s?._id),
+  userId: idStr(s?.userId ?? s?.user),
+  name: s?.name || '', email: s?.email || '',
+  type: s?.type === 'password' ? 'password' : 'general',
+  subject: s?.subject || '', message: s?.message || '',
+  status: s?.status || 'pending',
+  reply: s?.reply || '', resolvedByEmail: s?.resolvedByEmail || '',
+  at: s?.createdAt || s?.at || '',
+});
 
 // ── activity-log mapping (backend auto-logs; shape differs from the app's) ─────
 const cap = (s: string) => (s ? s[0].toUpperCase() + s.slice(1) : s);
@@ -149,17 +170,28 @@ const mapLog = (l: any) => ({
 
 // ── resource map: backend path + field transforms ─────────────────────────────
 // toClient(doc) → flat app shape;  toDb(body) → the backend's Mongoose shape.
+//
+// SCHEMA NOTE (the 2026-07-14 migration): there is no `notes` field anywhere in
+// the system any more. Company, Project, FundReceipt and Expenditure each carry
+// exactly ONE free-text field, `description`. Posting `notes` — or an
+// Expenditure `category` / `carryForwardAmount` — is rejected with a 422.
 const RES: Record<string, { path: string; toClient: (d: any) => any; toDb: (b: any) => any }> = {
   companies: {
     path: 'companies',
     toClient: (d) => ({
       id: idStr(d.id ?? d._id), name: d.name || '', cin: d.cin || d.registrationNo || '',
+      pan: d.pan || '',
       contact: d.contactPerson || d.contact || '', email: d.email || '',
-      phone: d.phone || '', address: d.address || '', notes: d.notes || '',
+      phone: d.phone || '', address: d.address || '', description: d.description || '',
     }),
     toDb: (b) => ({
-      name: b.name, cin: b.cin || '', contactPerson: b.contact || '',
-      email: b.email || '', phone: b.phone || '', address: b.address || '', notes: b.notes || '',
+      name: b.name, cin: b.cin || '',
+      // Optional, but when non-empty the server format-checks it against
+      // ^[A-Z]{5}[0-9]{4}[A-Z]$ and stores it uppercase (422 otherwise).
+      pan: (b.pan || '').toUpperCase(),
+      contactPerson: b.contact || '',
+      email: b.email || '', phone: b.phone || '', address: b.address || '',
+      description: b.description || '',
     }),
   },
   years: {
@@ -174,6 +206,9 @@ const RES: Record<string, { path: string; toClient: (d: any) => any; toDb: (b: a
     path: 'projects',
     toClient: (d) => ({
       id: idStr(d.id ?? d._id), name: d.name || '',
+      // The "Project ID" (e.g. RURA2025) — issued by the server, never sent by
+      // the client. Shown everywhere a project is named.
+      projectCode: d.projectCode || '',
       // A project is funded by ONE OR MORE companies — the live schema stores them
       // as an array (`companyIds`). Read the whole array (falling back to any legacy
       // singular field so old documents still show a company).
@@ -181,25 +216,29 @@ const RES: Record<string, { path: string; toClient: (d: any) => any; toDb: (b: a
         ? d.companyIds.map(idStr).filter(Boolean)
         : (d.company ?? d.companyId ? [idStr(d.company ?? d.companyId)] : []),
       category: d.category || '', location: d.location || '', budget: num(d.budget),
+      // The implementing agency / NGO delivering the project, when it isn't run directly.
+      interventionPartner: d.interventionPartner || '',
       status: d.status || 'active',
       // The live schema has no boolean `ongoing` — it's `derivedStatus: 'ongoing' | 'other'`.
       derivedStatus: d.derivedStatus === 'ongoing' ? 'ongoing' : 'other',
       description: d.description || '',
       startDate: dstr(d.startDate),
-      // endDate is derived server-side from the start date's financial year — never
-      // sent by the client, only read back for display.
-      endDate: dstr(d.endDate), notes: d.notes || '',
+      // endDate and financialYearId are BOTH derived server-side from the start
+      // date's financial year — never sent by the client, only read back for display.
+      endDate: dstr(d.endDate),
+      yearId: idStr(d.financialYear ?? d.financialYearId),
     }),
     // The live Project schema REQUIRES `companyIds` (non-empty array) and
-    // `derivedStatus` ('ongoing' | 'other'). Projects have NO financial year and
-    // NO client-supplied end date (both are omitted here — the server derives the
-    // end date from the start date's FY).
+    // `derivedStatus` ('ongoing' | 'other'). `projectCode`, `financialYearId` and
+    // `endDate` are omitted on purpose — the server derives all three from the
+    // start date and refuses to take them from the client.
     toDb: (b) => ({
       name: b.name, companyIds: Array.isArray(b.companyIds) ? b.companyIds.filter(Boolean) : [],
       category: b.category || '', location: b.location || '', budget: num(b.budget),
+      interventionPartner: b.interventionPartner || '',
       status: b.status || 'active', derivedStatus: b.derivedStatus === 'ongoing' ? 'ongoing' : 'other',
       description: b.description || '',
-      startDate: b.startDate || '', notes: b.notes || '',
+      startDate: b.startDate || '',
     }),
   },
   receipts: {
@@ -213,17 +252,19 @@ const RES: Record<string, { path: string; toClient: (d: any) => any; toDb: (b: a
       projectId: idStr(d.project ?? d.projectId),
       yearId: idStr(d.financialYear ?? d.financialYearId),
       // `reference` is shown as "Account Number" in the UI (field name kept to avoid a migration).
-      reference: d.reference || '', amount: num(d.amount), notes: d.notes || '',
-      // mode + carryForward are LEGACY — read for historical records, never collected on the form.
-      mode: d.mode || 'NEFT', carryForward: num(d.carryForward),
+      reference: d.reference || '', amount: num(d.amount), description: d.description || '',
     }),
     toDb: (b) => ({
       date: b.date || null, receiptType: b.receiptType || 'company',
+      // companyId is required for BOTH receipt types — money always arrives on
+      // behalf of some company.
       companyId: b.companyId, source: b.source || '',
       // projectId is optional — omit it entirely when unset so the server treats it as unallocated.
       ...(b.projectId ? { projectId: b.projectId } : {}),
       financialYearId: b.yearId, reference: b.reference || '',
-      amount: num(b.amount), notes: b.notes || '',
+      amount: num(b.amount), description: b.description || '',
+      // `mode` and `carryForward` are legacy columns: never collected on the form,
+      // never sent, and no report reads them any more.
     }),
   },
   expenditures: {
@@ -231,23 +272,28 @@ const RES: Record<string, { path: string; toClient: (d: any) => any; toDb: (b: a
     toClient: (d) => ({
       id: idStr(d.id ?? d._id), date: dstr(d.date), projectId: idStr(d.project ?? d.projectId),
       companyId: idStr(d.company ?? d.companyId), yearId: idStr(d.financialYear ?? d.financialYearId),
-      category: d.category || '', approvedBy: d.approvedBy || '', amount: num(d.amount),
-      // Unused budget rolled into next year — only meaningful when the project is Ongoing.
-      carryForwardAmount: num(d.carryForwardAmount),
-      description: d.description || '', reference: d.reference || '', notes: d.notes || '',
+      approvedBy: d.approvedBy || '', amount: num(d.amount),
+      description: d.description || '', reference: d.reference || '',
     }),
+    // An expenditure is deliberately minimal: project, company, financial year,
+    // amount, date, approved by, description. There is no category, no notes, no
+    // carryForwardAmount (carry forward is derived — see /reports/carry-forward),
+    // no natureOfExpense, no capitalAsset and no fundingRoute.
     toDb: (b) => ({
       date: b.date || null, projectId: b.projectId, companyId: b.companyId, financialYearId: b.yearId,
-      category: b.category || '', approvedBy: b.approvedBy || '', amount: num(b.amount),
-      carryForwardAmount: num(b.carryForwardAmount),
-      description: b.description || '', reference: b.reference || '', notes: b.notes || '',
+      approvedBy: b.approvedBy || '', amount: num(b.amount),
+      description: b.description || '', reference: b.reference || '',
     }),
   },
-  // Editable dropdown value-lists (Category / Status / Source) shown on the Master Data screen.
+  // Editable dropdown value-lists (Category / Status / Source) shown on the Master
+  // Data screen. For the Category list, `description` carries the Schedule VII clause.
   masterData: {
     path: 'master-data',
-    toClient: (d) => ({ id: idStr(d.id ?? d._id), type: d.type || '', value: d.value || '' }),
-    toDb: (b) => ({ type: b.type, value: b.value }),
+    toClient: (d) => ({
+      id: idStr(d.id ?? d._id), type: d.type || '', value: d.value || '',
+      description: d.description || '',
+    }),
+    toDb: (b) => ({ type: b.type, value: b.value, description: b.description || '' }),
   },
 };
 
@@ -261,6 +307,42 @@ export const api = {
     return { user: mapUser(data?.user), token: data?.token as string };
   },
   logout: async () => { try { await http.post('/auth/logout'); } catch {} await clearToken(); },
+
+  // Re-fetch the signed-in user (used after a forced password change clears
+  // mustChangePassword, so the gate re-evaluates against fresh server state).
+  me: async () => { const { data } = await http.get('/auth/me'); return mapUser(data?.user ?? data); },
+
+  // ── password recovery & change (2026-07-15 — admin-mediated, no email) ──
+  // Public + rate-limited. ALWAYS resolves (anti-enumeration): the endpoint
+  // returns { ok: true } whether or not the email exists, so we never leak which
+  // accounts are real. Creates a type:'password' SupportRequest for an admin.
+  forgotPassword: async (email: string) => {
+    try { await http.post('/auth/forgot-password', { email: String(email || '').trim().toLowerCase() }); } catch {}
+    return { ok: true };
+  },
+  // Verifies currentPassword, sets newPassword, clears mustChangePassword.
+  // newPassword must be min 8 chars, ≥1 letter, ≥1 number (server-enforced).
+  changePassword: async (currentPassword: string, newPassword: string) => {
+    await http.post('/auth/change-password', { currentPassword, newPassword });
+  },
+
+  // ── support requests (help desk) ──
+  createSupportRequest: async (subject: string, message: string) => {
+    const { data } = await http.post('/support-requests', { subject, message });
+    return mapSupport(data);
+  },
+  getMySupportRequests: async () => { const { data } = await http.get('/support-requests/mine'); return (data || []).map(mapSupport); },
+  // Admin: the pending queue (both password + general tickets).
+  getSupportRequests: async () => { const { data } = await http.get('/support-requests'); return (data || []).map(mapSupport); },
+  // Admin, password tickets only → resets the user to <firstname>@apl123 and
+  // returns { id, tempPassword } so the admin can relay it out-of-band.
+  approveSupportRequest: async (id: string) => {
+    const { data } = await http.post(`/support-requests/${id}/approve`);
+    return { id: idStr(data?.id) || id, tempPassword: data?.tempPassword || '' };
+  },
+  rejectSupportRequest: async (id: string) => { await http.post(`/support-requests/${id}/reject`); },
+  // Admin, general tickets only → marks the ticket resolved; reply shows on My Requests.
+  replySupportRequest: async (id: string, reply: string) => { await http.post(`/support-requests/${id}/reply`, { reply }); },
 
   // ── users (admin only on the server) ──
   getUsers: async () => { const { data } = await http.get('/users'); return (data || []).map(mapUser); },
@@ -282,6 +364,17 @@ export const api = {
   reportYearWise: async () => { const { data } = await http.get('/reports/year-wise'); return data || []; },
   reportCompanyPositions: async () => { const { data } = await http.get('/reports/company-positions'); return data || []; },
 
+  // Carry forward is DERIVED — never stored, never posted. One row per
+  // (Ongoing project × company): max(0, received − spent) for that pair.
+  reportCarryForward: async () => {
+    const { data } = await http.get('/reports/carry-forward');
+    return (data || []).map((r: any) => ({
+      projectId: idStr(r.projectId), projectCode: r.projectCode || '', projectName: r.projectName || '',
+      companyId: idStr(r.companyId), companyName: r.companyName || '',
+      received: num(r.received), spent: num(r.spent), carryForward: num(r.carryForward),
+    }));
+  },
+
   // ── generic resource CRUD ──
   list: async (resource: string) => { const c = RES[resource]; const { data } = await http.get('/' + c.path); return (data || []).map(c.toClient); },
   create: async (resource: string, body: any) => { const c = RES[resource]; const { data } = await http.post('/' + c.path, c.toDb(body)); return c.toClient(data); },
@@ -301,7 +394,9 @@ export const api = {
 
   // ── document attachments (Projects / Expenditures / Fund Receipts) ──
   // `parent` is the app resource key; mapped to the backend path here so callers
-  // never hardcode a URL. Bytes live in MongoDB (no disk on the free tier).
+  // never hardcode a URL. Bytes live in MongoDB (no disk on the free tier), so a
+  // file is capped at 15 MB and that cap cannot be lifted — see FEATURES.md §5.10.
+  // There is NO limit on how many documents a record can carry.
   listDocuments: async (parent: 'projects' | 'expenditures' | 'receipts', id: string) => {
     const path = RES[parent].path;
     const { data } = await http.get(`/${path}/${id}/documents`);
@@ -336,10 +431,33 @@ export const api = {
   },
 
   // ── server-generated report files (PDF / Excel) ──
-  // The native file download can't set an Authorization header, so these endpoints
-  // additionally accept the JWT via ?token=. Returns a fully-qualified URL.
+  // The report tables are rendered by the SERVER, so an exported file always
+  // matches what the website produces for the same tab.
+  //
+  // The endpoints also accept the JWT via ?token= (a native file download can't set
+  // an Authorization header) — that URL is exposed for anything that needs a plain
+  // link. The app itself pulls the bytes through axios (which does send the header,
+  // so the token never leaks into a URL) and hands the share sheet a data: URL.
   reportExportUrl: (kind: 'pdf' | 'excel', type: string) =>
     `${BASE}/reports/export/${kind}?type=${encodeURIComponent(type)}${authToken ? `&token=${encodeURIComponent(authToken)}` : ''}`,
-  reportLedger: async () => { const { data } = await http.get('/reports/ledger'); return data || []; },
-  reportCarryForward: async () => { const { data } = await http.get('/reports/carry-forward'); return data || []; },
+
+  // `companyId` is only used by the `company-detail` report (a comprehensive
+  // per-company report); it is ignored by every other type.
+  reportExportFile: async (kind: 'pdf' | 'excel', type: string, companyId?: string) => {
+    const { data } = await http.get(`/reports/export/${kind}`, {
+      params: companyId ? { type, companyId } : { type },
+      responseType: 'arraybuffer' as any,
+    });
+    const mime = kind === 'pdf'
+      ? 'application/pdf'
+      : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    const bytes = new Uint8Array(data);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return {
+      dataUrl: `data:${mime};base64,${base64Encode(binary)}`,
+      mime,
+      filename: `CSR_${type}_report.${kind === 'pdf' ? 'pdf' : 'xlsx'}`,
+    };
+  },
 };

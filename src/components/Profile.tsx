@@ -14,13 +14,27 @@ import { Buildings } from 'phosphor-react-native/src/icons/Buildings';
 import { ClockCounterClockwise } from 'phosphor-react-native/src/icons/ClockCounterClockwise';
 import { MagnifyingGlass } from 'phosphor-react-native/src/icons/MagnifyingGlass';
 import { ShareNetwork } from 'phosphor-react-native/src/icons/ShareNetwork';
-import { CaretLeft } from 'phosphor-react-native/src/icons/CaretLeft';
-import { CaretRight } from 'phosphor-react-native/src/icons/CaretRight';
+import { LockKey } from 'phosphor-react-native/src/icons/LockKey';
+import { Headset } from 'phosphor-react-native/src/icons/Headset';
+import { Tray } from 'phosphor-react-native/src/icons/Tray';
+import { ArrowClockwise } from 'phosphor-react-native/src/icons/ArrowClockwise';
 import { theme } from '../theme';
+import { api } from '../api';
 import {
-  ActivityLog, Card, Header, Pill, Role,
+  ActivityLog, Button, Card, ChangePasswordForm, DataTable, EmptyState, Header, Input, Pill, Role, TCell,
   ROLE_LABEL, ROLE_TONE, fmtDateTime, useAuth,
 } from '../../App';
+
+// A help-desk ticket as returned by GET /support-requests/mine (see api.mapSupport).
+type SupportRequest = {
+  id: string;
+  type: 'password' | 'general';
+  subject: string;
+  message: string;
+  status: 'pending' | 'approved' | 'rejected' | 'resolved';
+  reply: string;
+  at: string;
+};
 
 const PAGE = 8; // activity rows per page
 
@@ -48,8 +62,40 @@ export default function Profile() {
     return logs.filter(l => (l.userEmail || '').toLowerCase() === email);
   }, [logs, user]);
 
+  // ── Help-desk tickets (Raise a Request / My Requests) ──────────────────────
+  const [requests, setRequests] = useState<SupportRequest[]>([]);
+  const [loadingReqs, setLoadingReqs] = useState(false);
+  const loadRequests = React.useCallback(async () => {
+    setLoadingReqs(true);
+    try { setRequests(await api.getMySupportRequests()); }
+    catch { /* leave the current list in place on error */ }
+    finally { setLoadingReqs(false); }
+  }, []);
+  React.useEffect(() => { loadRequests(); }, [loadRequests]);
+
+  // The "Raise a Request" form.
+  const [subject, setSubject] = useState('');
+  const [message, setMessage] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [sent, setSent] = useState(false);
+  const canSubmit = subject.trim().length > 0 && message.trim().length > 0 && !submitting;
+  const submitRequest = async () => {
+    if (!canSubmit) return;
+    setSubmitting(true);
+    try {
+      await api.createSupportRequest(subject.trim(), message.trim());
+      setSubject(''); setMessage('');
+      setSent(true);
+      setTimeout(() => setSent(false), 4000);
+      await loadRequests();
+    } catch {
+      /* keep the typed text so the user can retry */
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   const [query, setQuery] = useState('');
-  const [page, setPage] = useState(1);
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return mine;
@@ -65,18 +111,11 @@ export default function Profile() {
     try { await Share.share({ title: 'CSR Activity', message: msg }); } catch {}
   };
 
-  const total = filtered.length;
-  const pages = Math.max(1, Math.ceil(total / PAGE));
-  const safe = Math.min(page, pages);
-  const from = total === 0 ? 0 : (safe - 1) * PAGE + 1;
-  const to = Math.min(safe * PAGE, total);
-  const slice = filtered.slice((safe - 1) * PAGE, safe * PAGE);
-
   if (!user) return null;
 
   return (
     <View style={{ flex: 1 }}>
-      <Header title="My Profile" subtitle="Your account & activity history" />
+      <Header title="My Dashboard" subtitle="Your account, password & help-desk requests" />
       <ScrollView contentContainerStyle={styles.body} showsVerticalScrollIndicator={false}>
         {/* Identity card */}
         <Card style={{ marginTop: 4 }}>
@@ -101,6 +140,83 @@ export default function Profile() {
           <InfoRow icon={<Buildings size={18} color={theme.primary} weight="bold" />} label="Company" value={user.company || '—'} last />
         </Card>
 
+        {/* Change Password */}
+        <Card style={{ marginTop: 12 }}>
+          <View style={styles.cardHead}>
+            <View style={styles.cardHeadIcon}><LockKey size={18} color={theme.primary} weight="bold" /></View>
+            <Text style={styles.cardTitle}>Change Password</Text>
+          </View>
+          <View style={{ marginTop: 14 }}>
+            <ChangePasswordForm />
+          </View>
+        </Card>
+
+        {/* Raise a Request — files a general help-desk ticket */}
+        <Card style={{ marginTop: 12 }}>
+          <View style={styles.cardHead}>
+            <View style={styles.cardHeadIcon}><Headset size={18} color={theme.primary} weight="bold" /></View>
+            <Text style={styles.cardTitle}>Raise a Request</Text>
+          </View>
+          <Text style={styles.sectionHint}>Ask the admin a question or request a change. They'll reply here.</Text>
+          <Input
+            value={subject}
+            onChangeText={setSubject}
+            placeholder="Subject"
+            style={{ marginTop: 12 }}
+          />
+          <Input
+            value={message}
+            onChangeText={setMessage}
+            placeholder="Describe your request…"
+            multiline
+            style={{ marginTop: 10 }}
+          />
+          {sent && <Text style={styles.sentMsg}>Request sent — the admin has been notified.</Text>}
+          <View style={{ marginTop: 12 }}>
+            <Button label={submitting ? 'Sending…' : 'Submit Request'} onPress={submitRequest} disabled={!canSubmit} />
+          </View>
+        </Card>
+
+        {/* My Requests — this user's tickets + admin replies */}
+        <Card style={{ marginTop: 12 }}>
+          <View style={styles.cardHead}>
+            <View style={styles.cardHeadIcon}><Tray size={18} color={theme.primary} weight="bold" /></View>
+            <Text style={styles.cardTitle}>My Requests</Text>
+            <Pressable hitSlop={8} onPress={loadRequests} disabled={loadingReqs} style={[styles.refreshBtn, loadingReqs && { opacity: 0.5 }]}>
+              <ArrowClockwise size={16} color={theme.primary} weight="bold" />
+            </Pressable>
+          </View>
+
+          {requests.length === 0 ? (
+            <View style={{ marginTop: 14 }}>
+              <EmptyState text={loadingReqs ? 'Loading your requests…' : 'No requests yet — anything you raise will appear here.'} />
+            </View>
+          ) : (
+            requests.map(r => {
+              const title = r.subject || (r.type === 'password' ? 'Password reset request' : 'Request');
+              const tone = r.status === 'approved' || r.status === 'resolved' ? 'success'
+                : r.status === 'rejected' ? 'danger' : 'amber';
+              const statusLabel = r.status.charAt(0).toUpperCase() + r.status.slice(1);
+              return (
+                <View key={r.id} style={styles.reqItem}>
+                  <View style={styles.reqTop}>
+                    <Text style={styles.reqTitle} numberOfLines={2}>{title}</Text>
+                    <Pill text={statusLabel} tone={tone} />
+                  </View>
+                  {!!r.at && <Text style={styles.reqDate}>{fmtDateTime(r.at)}</Text>}
+                  {!!r.message && <Text style={styles.reqMsg}>{r.message}</Text>}
+                  {!!r.reply && (
+                    <View style={styles.replyBox}>
+                      <Text style={styles.replyLabel}>Admin reply</Text>
+                      <Text style={styles.replyText}>{r.reply}</Text>
+                    </View>
+                  )}
+                </View>
+              );
+            })
+          )}
+        </Card>
+
         {/* My activity logs */}
         <Card style={{ marginTop: 12, paddingHorizontal: 0, marginBottom: 4 }}>
           <View style={[styles.cardHead, { paddingHorizontal: 16 }]}>
@@ -112,45 +228,35 @@ export default function Profile() {
           <View style={{ paddingHorizontal: 16, marginTop: 12 }}>
             <View style={styles.search}>
               <MagnifyingGlass size={16} color={theme.faint} />
-              <TextInput value={query} onChangeText={t => { setQuery(t); setPage(1); }}
+              <TextInput value={query} onChangeText={setQuery}
                 placeholder="Search my activity…" placeholderTextColor={theme.faint}
                 style={styles.searchInput} autoCapitalize="none" autoCorrect={false} />
             </View>
           </View>
 
-          <View style={{ marginTop: 6 }}>
-            {slice.length === 0
-              ? <Text style={styles.empty}>No activity yet — your actions will appear here.</Text>
-              : slice.map(l => (
-                  <View key={l.id} style={styles.logRow}>
-                    <View style={styles.logDot} />
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.logAction}>{l.action}</Text>
-                      <Text style={styles.logWhen}>{fmtDateTime(l.at)}</Text>
-                    </View>
-                    <Pressable hitSlop={8} onPress={() => shareLog(l)}>
-                      <ShareNetwork size={17} color={theme.primary} />
+          {/* My activity, as a table — same grid as every other list in the app. */}
+          <View style={{ paddingHorizontal: 16, marginTop: 10 }}>
+            <DataTable
+              rows={filtered}
+              keyFor={l => l.id}
+              empty="No activity yet — your actions will appear here."
+              pageSize={PAGE}
+              resetKey={query}
+              columns={[
+                // Two lines: an activity line like 'Updated Project "…"' is long.
+                { label: 'ACTIVITY', width: 200, render: l => <TCell text={l.action} strong lines={2} /> },
+                { label: 'WHEN', width: 150, render: l => <TCell text={fmtDateTime(l.at)} /> },
+                {
+                  label: '', width: 60, right: true,
+                  render: l => (
+                    <Pressable hitSlop={8} onPress={() => shareLog(l)} style={styles.rowBtn}>
+                      <ShareNetwork size={16} color={theme.primary} />
                     </Pressable>
-                  </View>
-                ))}
+                  ),
+                },
+              ]}
+            />
           </View>
-
-          {total > PAGE ? (
-            <View style={styles.pager}>
-              <Text style={styles.pagerText}>Showing {from}–{to} of {total}</Text>
-              <View style={styles.pagerBtns}>
-                <Pressable disabled={safe <= 1} hitSlop={6} onPress={() => setPage(safe - 1)}
-                  style={[styles.pagerBtn, safe <= 1 && styles.pagerOff]}>
-                  <CaretLeft size={15} color={safe <= 1 ? theme.faint : theme.text} weight="bold" />
-                </Pressable>
-                <View style={styles.pagerNum}><Text style={styles.pagerNumText}>{safe}</Text></View>
-                <Pressable disabled={safe >= pages} hitSlop={6} onPress={() => setPage(safe + 1)}
-                  style={[styles.pagerBtn, safe >= pages && styles.pagerOff]}>
-                  <CaretRight size={15} color={safe >= pages ? theme.faint : theme.text} weight="bold" />
-                </Pressable>
-              </View>
-            </View>
-          ) : null}
         </Card>
       </ScrollView>
     </View>
@@ -202,24 +308,23 @@ const styles = StyleSheet.create({
   },
   searchInput: { flex: 1, fontSize: 14, color: theme.text, paddingVertical: 10 },
 
-  logRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 12,
-    paddingVertical: 12, paddingHorizontal: 16,
-    borderBottomWidth: 1, borderBottomColor: theme.border,
-  },
-  logDot: { width: 9, height: 9, borderRadius: 999, backgroundColor: theme.primary },
-  logAction: { fontSize: 13.5, color: theme.text, fontWeight: '700' },
-  logWhen: { fontSize: 12, color: theme.muted, marginTop: 3, fontWeight: '600' },
-  empty: { fontSize: 13, color: theme.faint, fontStyle: 'italic', paddingVertical: 22, paddingHorizontal: 16 },
+  // The share button in the activity table's last column.
+  rowBtn: { width: 30, height: 30, borderRadius: 9, backgroundColor: '#f3f4fb', alignItems: 'center', justifyContent: 'center' },
 
-  pager: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingHorizontal: 16, paddingTop: 12,
+  // Raise a Request / My Requests.
+  sectionHint: { fontSize: 12.5, color: theme.muted, marginTop: 10, lineHeight: 18 },
+  sentMsg: { fontSize: 12.5, color: theme.success, fontWeight: '700', marginTop: 12 },
+  refreshBtn: { marginLeft: 'auto', width: 32, height: 32, borderRadius: 9, backgroundColor: theme.primarySoft, alignItems: 'center', justifyContent: 'center' },
+
+  reqItem: { marginTop: 14, paddingTop: 14, borderTopWidth: 1, borderTopColor: theme.border },
+  reqTop: { flexDirection: 'row', alignItems: 'flex-start', gap: 10 },
+  reqTitle: { flex: 1, fontSize: 14.5, fontWeight: '800', color: theme.text, lineHeight: 20 },
+  reqDate: { fontSize: 11.5, color: theme.faint, fontWeight: '700', marginTop: 4 },
+  reqMsg: { fontSize: 13, color: theme.muted, marginTop: 8, lineHeight: 19 },
+  replyBox: {
+    marginTop: 10, padding: 12, borderRadius: 12,
+    backgroundColor: theme.primarySoft, borderWidth: 1, borderColor: theme.border,
   },
-  pagerText: { fontSize: 12, color: theme.muted, fontWeight: '600' },
-  pagerBtns: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  pagerBtn: { width: 30, height: 30, borderRadius: 9, borderWidth: 1, borderColor: theme.border, alignItems: 'center', justifyContent: 'center', backgroundColor: '#fff' },
-  pagerOff: { backgroundColor: '#f7f8fd' },
-  pagerNum: { minWidth: 30, height: 30, borderRadius: 9, backgroundColor: theme.primary, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6 },
-  pagerNumText: { color: '#fff', fontWeight: '800', fontSize: 13 },
+  replyLabel: { fontSize: 11, color: theme.primary, fontWeight: '800', letterSpacing: 0.3, textTransform: 'uppercase' },
+  replyText: { fontSize: 13, color: theme.text, marginTop: 4, lineHeight: 19 },
 });

@@ -11,7 +11,13 @@ import { Envelope } from 'phosphor-react-native/src/icons/Envelope';
 import { Lock } from 'phosphor-react-native/src/icons/Lock';
 import { Eye } from 'phosphor-react-native/src/icons/Eye';
 import { EyeSlash } from 'phosphor-react-native/src/icons/EyeSlash';
+import { CheckCircle } from 'phosphor-react-native/src/icons/CheckCircle';
 import { theme } from '../theme';
+import { api } from '../api';
+
+// Basic shape check — non-empty, single @, a dot in the domain. Good enough to
+// gate the button; the server does the real work.
+const looksLikeEmail = (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim());
 
 // `authenticate` checks the credentials against the DB-backed API. It returns
 // an error string to show, or null on success — at which point AuthGate swaps
@@ -25,6 +31,14 @@ export default function Login({ authenticate }: { authenticate: (email: string, 
   const [busy, setBusy] = useState(false);
   const passwordRef = useRef<TextInput>(null);
 
+  // Forgot-password flow. `mode` is 'login' (normal) or 'forgot' (recovery
+  // form). Once submitted we show the same anti-enumeration confirmation.
+  const [mode, setMode] = useState<'login' | 'forgot'>('login');
+  const [fpEmail, setFpEmail] = useState('');
+  const [fpError, setFpError] = useState('');
+  const [fpBusy, setFpBusy] = useState(false);
+  const [fpSent, setFpSent] = useState(false);
+
   const submit = async () => {
     if (busy) return;
     if (!email.trim() || !password.trim()) { setError('Please enter your email and password.'); return; }
@@ -32,6 +46,30 @@ export default function Login({ authenticate }: { authenticate: (email: string, 
     const err = await authenticate(email, password);
     setBusy(false);
     setError(err ?? '');
+  };
+
+  const openForgot = () => {
+    setMode('forgot');
+    setFpEmail(email.trim());
+    setFpError('');
+    setFpSent(false);
+  };
+
+  const backToLogin = () => {
+    setMode('login');
+    setFpError('');
+    setFpSent(false);
+  };
+
+  const submitForgot = async () => {
+    if (fpBusy) return;
+    if (!looksLikeEmail(fpEmail)) { setFpError('Please enter a valid email address.'); return; }
+    setFpBusy(true);
+    // Public, rate-limited, and always resolves — never reveals whether the
+    // account exists. We show the same confirmation no matter what.
+    await api.forgotPassword(fpEmail.trim());
+    setFpBusy(false);
+    setFpSent(true);
   };
 
   return (
@@ -49,8 +87,69 @@ export default function Login({ authenticate }: { authenticate: (email: string, 
               <Image source={require('../assets/logo.png')} style={styles.logo} resizeMode="contain" />
             </View>
             <Text style={styles.title}>CSR Fund Manager</Text>
-            <Text style={styles.subtitle}>Sign in to your account</Text>
+            <Text style={styles.subtitle}>
+              {mode === 'forgot' ? 'Reset your password' : 'Sign in to your account'}
+            </Text>
 
+            {mode === 'forgot' ? (
+              fpSent ? (
+                /* Anti-enumeration confirmation — identical regardless of input. */
+                <View>
+                  <View style={styles.sentBox}>
+                    <CheckCircle size={20} color={theme.primary} weight="fill" />
+                    <Text style={styles.sentText}>
+                      If an account exists for that email, an administrator will review your
+                      request and share a temporary password with you.
+                    </Text>
+                  </View>
+                  <Pressable onPress={backToLogin} hitSlop={8} style={styles.linkWrap}>
+                    <Text style={styles.link}>Back to sign in</Text>
+                  </Pressable>
+                </View>
+              ) : (
+                <View>
+                  <Text style={styles.fpHelp}>
+                    Enter your account email. An administrator will review your request — no
+                    email is sent.
+                  </Text>
+
+                  {/* Email only */}
+                  <View style={[styles.inputRow, !!fpError && styles.inputRowError]}>
+                    <Envelope size={18} color={theme.faint} weight="bold" />
+                    <TextInput
+                      value={fpEmail}
+                      onChangeText={t => { setFpEmail(t); if (fpError) setFpError(''); }}
+                      placeholder="you@company.com"
+                      placeholderTextColor={theme.faint}
+                      autoCapitalize="none"
+                      keyboardType="email-address"
+                      autoCorrect={false}
+                      style={styles.input}
+                      returnKeyType="go"
+                      onSubmitEditing={submitForgot}
+                    />
+                  </View>
+
+                  {fpError ? <Text style={styles.error}>{fpError}</Text> : null}
+
+                  <Pressable
+                    onPress={submitForgot}
+                    disabled={fpBusy || !looksLikeEmail(fpEmail)}
+                    style={({ pressed }) => [
+                      styles.signBtn,
+                      (pressed || fpBusy) && { backgroundColor: theme.primaryDk },
+                      (fpBusy || !looksLikeEmail(fpEmail)) && { opacity: 0.5 },
+                    ]}>
+                    <Text style={styles.signText}>{fpBusy ? 'Submitting…' : 'Submit request'}</Text>
+                  </Pressable>
+
+                  <Pressable onPress={backToLogin} hitSlop={8} style={styles.linkWrap}>
+                    <Text style={styles.link}>Back to sign in</Text>
+                  </Pressable>
+                </View>
+              )
+            ) : (
+            <>
             {/* Email */}
             <View style={[styles.inputRow, !!error && styles.inputRowError]}>
               <Envelope size={18} color={theme.faint} weight="bold" />
@@ -101,6 +200,11 @@ export default function Login({ authenticate }: { authenticate: (email: string, 
               <Text style={styles.signText}>{busy ? 'Signing in…' : 'Sign in'}</Text>
             </Pressable>
 
+            {/* Forgot password */}
+            <Pressable onPress={openForgot} hitSlop={8} style={styles.linkWrap}>
+              <Text style={styles.link}>Forgot password?</Text>
+            </Pressable>
+
             {/* Admin hint */}
             <View style={styles.hintBox}>
               <Text style={styles.hintTitle}>Administrator login</Text>
@@ -110,6 +214,8 @@ export default function Login({ authenticate }: { authenticate: (email: string, 
             <Text style={styles.footer}>
               Editor & viewer accounts are created by the administrator from the Admin Panel.
             </Text>
+            </>
+            )}
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -151,6 +257,18 @@ const styles = StyleSheet.create({
     alignItems: 'center', marginTop: 4,
   },
   signText: { color: '#fff', fontWeight: '800', fontSize: 15 },
+
+  linkWrap: { alignSelf: 'center', marginTop: 14, paddingVertical: 4 },
+  link: { color: theme.primary, fontSize: 13.5, fontWeight: '700' },
+
+  fpHelp: { fontSize: 13, color: theme.muted, lineHeight: 19, marginBottom: 16 },
+
+  sentBox: {
+    flexDirection: 'row', alignItems: 'flex-start', gap: 10,
+    backgroundColor: '#eef7f0', borderRadius: 12, padding: 14,
+    borderWidth: 1, borderColor: theme.border, marginBottom: 4,
+  },
+  sentText: { flex: 1, fontSize: 13, color: theme.text, lineHeight: 19, fontWeight: '600' },
 
   hintBox: {
     backgroundColor: '#f1f2f9', borderRadius: 12, padding: 12, marginTop: 18,

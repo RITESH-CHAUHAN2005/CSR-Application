@@ -1,19 +1,23 @@
 // Screen — Master Data (§5.7): three tabs (Category / Status / Source) picked
-// via a segmented control, each showing a simple list of that type's values
-// with add / edit / delete. These lists populate the Category dropdowns
-// (Projects, Expenditures) and the Source dropdown (Other-Source receipts).
-// Deleting a value here does NOT rewrite records that already use it.
+// via a segmented control, each showing that type's values WITH THEIR DESCRIPTION,
+// plus add / edit / delete. These lists populate the Category dropdown (Projects)
+// and the Source dropdown (Other-Source receipts).
+//
+// The Category list holds the 12 statutory Schedule VII activity heads: a short
+// 2–3 word `value` to pick from, with the full clause as its `description`. The app
+// never hard-codes that list — it reads it from GET /master-data, so an admin
+// editing it here is reflected everywhere.
+//
+// Deleting a value does NOT rewrite records that already use it.
 import React, { useState } from 'react';
 import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Tag } from 'phosphor-react-native/src/icons/Tag';
 import { CheckCircle } from 'phosphor-react-native/src/icons/CheckCircle';
 import { Drop } from 'phosphor-react-native/src/icons/Drop';
-import { PencilSimple } from 'phosphor-react-native/src/icons/PencilSimple';
-import { Trash } from 'phosphor-react-native/src/icons/Trash';
 import { theme } from '../theme';
 import {
-  AddPill, Button, Card, Confirm, EmptyState, Field, Header, Input, MasterDataItem,
-  Modal, useAuth,
+  AddPill, Button, Confirm, DataTable, ExportButtons, Field, Header, Input, MasterDataItem,
+  Modal, RowActions, TCell, useAuth,
 } from '../../App';
 
 type MasterType = MasterDataItem['type'];
@@ -25,10 +29,10 @@ type Props = {
   remove: (id: string) => void;
 };
 
-const TABS: { key: MasterType; label: string; noun: string }[] = [
-  { key: 'category', label: 'Category', noun: 'category' },
-  { key: 'status', label: 'Status', noun: 'status' },
-  { key: 'source', label: 'Source', noun: 'source' },
+const TABS: { key: MasterType; label: string; noun: string; hint: string }[] = [
+  { key: 'category', label: 'Category', noun: 'category', hint: 'The 12 Schedule VII activity heads. The description carries the statutory clause.' },
+  { key: 'status', label: 'Status', noun: 'status', hint: 'Status values used across the app.' },
+  { key: 'source', label: 'Source', noun: 'source', hint: 'Income earned on a company’s funds — Interest, SIP, FD…' },
 ];
 
 const TAB_ICON: Record<MasterType, React.ComponentType<{ size?: number; color?: string; weight?: any }>> = {
@@ -37,29 +41,38 @@ const TAB_ICON: Record<MasterType, React.ComponentType<{ size?: number; color?: 
   source: Drop,
 };
 
+const blank = { value: '', description: '' };
+
 export default function MasterData({ items, add, update, remove }: Props) {
   const { canEdit } = useAuth();
   const [activeTab, setActiveTab] = useState<MasterType>('category');
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<MasterDataItem | null>(null);
-  const [value, setValue] = useState('');
+  const [form, setForm] = useState(blank);
   const [delId, setDelId] = useState<string | null>(null);
+
+  const set = <K extends keyof typeof blank>(k: K, v: string) => setForm(f => ({ ...f, [k]: v }));
 
   const tab = TABS.find(t => t.key === activeTab)!;
   const rows = items.filter(i => i.type === activeTab);
   const Icon = TAB_ICON[activeTab];
 
-  const openAdd = () => { setEditing(null); setValue(''); setShowForm(true); };
-  const openEdit = (m: MasterDataItem) => { setEditing(m); setValue(m.value); setShowForm(true); };
+  const openAdd = () => { setEditing(null); setForm(blank); setShowForm(true); };
+  const openEdit = (m: MasterDataItem) => {
+    setEditing(m);
+    setForm({ value: m.value, description: m.description });
+    setShowForm(true);
+  };
 
   const save = () => {
-    const v = value.trim();
+    const v = form.value.trim();
     if (!v) {
       Alert.alert('Missing value', 'Please enter a value.');
       return;
     }
-    if (editing) update(editing.id, { type: editing.type, value: v });
-    else add({ type: activeTab, value: v });
+    const payload = { value: v, description: form.description.trim() };
+    if (editing) update(editing.id, { type: editing.type, ...payload });
+    else add({ type: activeTab, ...payload });
     setShowForm(false);
   };
 
@@ -78,27 +91,42 @@ export default function MasterData({ items, add, update, remove }: Props) {
             );
           })}
         </View>
+        <Text style={styles.tabHint}>{tab.hint}</Text>
 
-        {rows.length === 0 && <EmptyState text={`No ${tab.noun} values yet.`} />}
+        {/* Server-generated PDF / Excel of all master-data values — shown for
+            all roles (§5.11). The export covers every type, so one set at the
+            screen level (not per-tab) is correct. */}
+        <ExportButtons type="master-data" />
 
-        {rows.map(m => (
-          <Card key={m.id} style={styles.card}>
-            <View style={styles.chip}>
-              <Icon size={20} color={theme.primary} weight="fill" />
-            </View>
-            <Text style={styles.value} numberOfLines={2}>{m.value}</Text>
-            {canEdit && (
-              <>
-                <Pressable style={styles.iconBtn} onPress={() => openEdit(m)} hitSlop={6}>
-                  <PencilSimple size={16} color={theme.primary} />
-                </Pressable>
-                <Pressable style={styles.iconBtn} onPress={() => setDelId(m.id)} hitSlop={6}>
-                  <Trash size={16} color={theme.danger} />
-                </Pressable>
-              </>
-            )}
-          </Card>
-        ))}
+        {/* Each value with the description underneath it — for a Category that
+            description IS the Schedule VII clause, so it needs room to breathe. */}
+        <DataTable
+          rows={rows}
+          keyFor={m => m.id}
+          empty={`No ${tab.noun} values yet.`}
+          resetKey={activeTab}
+          pageSize={6}
+          columns={[
+            {
+              label: 'VALUE', width: canEdit ? 250 : 320, grow: true,
+              render: m => (
+                <View style={{ gap: 4 }}>
+                  <View style={styles.valueCell}>
+                    <Icon size={16} color={theme.primary} weight="fill" />
+                    <TCell text={m.value} strong />
+                  </View>
+                  {!!m.description && (
+                    <Text style={styles.desc} numberOfLines={4}>{m.description}</Text>
+                  )}
+                </View>
+              ),
+            },
+            ...(canEdit ? [{
+              label: '', width: 90, right: true,
+              render: (m: MasterDataItem) => <RowActions onEdit={() => openEdit(m)} onDelete={() => setDelId(m.id)} />,
+            }] : []),
+          ]}
+        />
       </ScrollView>
 
       <Modal
@@ -107,7 +135,17 @@ export default function MasterData({ items, add, update, remove }: Props) {
         onClose={() => setShowForm(false)}
       >
         <Field label="Value *">
-          <Input value={value} onChangeText={setValue} placeholder={`Enter ${tab.noun} value`} autoFocus />
+          <Input value={form.value} onChangeText={t => set('value', t)} placeholder={`Enter ${tab.noun} value`} autoFocus />
+        </Field>
+        <Field label="Description">
+          <Input
+            value={form.description}
+            onChangeText={t => set('description', t)}
+            placeholder={activeTab === 'category'
+              ? 'The Schedule VII clause this head covers…'
+              : 'What this value covers…'}
+            multiline
+          />
         </Field>
         <Button label={editing ? 'Save Changes' : 'Add Value'} onPress={save} />
       </Modal>
@@ -131,9 +169,8 @@ const styles = StyleSheet.create({
   segBtnOn: { backgroundColor: '#fff', shadowColor: '#1e1b4b', shadowOpacity: 0.08, shadowRadius: 6, shadowOffset: { width: 0, height: 2 }, elevation: 2 },
   segText: { fontSize: 12.5, fontWeight: '700', color: theme.muted },
   segTextOn: { color: theme.primary },
+  tabHint: { fontSize: 12, color: theme.faint, fontWeight: '500', lineHeight: 17, marginTop: -2 },
 
-  card: { flexDirection: 'row', alignItems: 'center', gap: 13 },
-  chip: { width: 42, height: 42, borderRadius: 12, backgroundColor: theme.primarySoft, alignItems: 'center', justifyContent: 'center' },
-  value: { flex: 1, fontSize: 15, fontWeight: '700', color: theme.text },
-  iconBtn: { width: 34, height: 34, borderRadius: 10, backgroundColor: '#f3f4fb', alignItems: 'center', justifyContent: 'center' },
+  valueCell: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  desc: { fontSize: 11.5, color: theme.muted, fontWeight: '500', lineHeight: 16 },
 });

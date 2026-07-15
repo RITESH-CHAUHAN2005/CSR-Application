@@ -13,13 +13,16 @@ import { Briefcase } from 'phosphor-react-native/src/icons/Briefcase';
 import { theme } from '../theme';
 import {
   Card,
+  CarryForwardRow,
   Company,
+  DataTable,
   Expenditure,
   FinancialYear,
   FundReceipt,
   Header,
   Project,
   StatCard,
+  TCell,
   companyReceived,
   companyCarryForward,
   companyExpenditure,
@@ -36,6 +39,10 @@ type Props = {
   projects: Project[];
   receipts: FundReceipt[];
   expenditures: Expenditure[];
+  // Server-derived: one row per (Ongoing project × company). Used only for the
+  // Carry Forward column of the Company Fund Positions table when the backend
+  // summary hasn't loaded yet.
+  carryForward: CarryForwardRow[];
 };
 
 // Rotating slice palette for the pie + legend — stays inside the app's theme.
@@ -68,13 +75,14 @@ const arc = (cx: number, cy: number, r: number, start: number, end: number) => {
 };
 
 // Columns for the sortable Company Fund Positions table (DataTables-style).
+// The sortable fields of the Company Fund Positions table, shown as chips above it.
 const POS_COLS = [
-  { key: 'company', label: 'Company', w: 'cCompany', right: false },
-  { key: 'received', label: 'Received', w: 'cNum', right: true },
-  { key: 'carry', label: 'Carry Fwd', w: 'cNum', right: true },
-  { key: 'expenditure', label: 'Expenditure', w: 'cNum', right: true },
-  { key: 'balance', label: 'Balance', w: 'cNum', right: true },
-  { key: 'projects', label: 'Projects', w: 'cProj', right: true },
+  { key: 'company', label: 'Company' },
+  { key: 'received', label: 'Received' },
+  { key: 'carry', label: 'Carry Fwd' },
+  { key: 'expenditure', label: 'Expenditure' },
+  { key: 'balance', label: 'Balance' },
+  { key: 'projects', label: 'Projects' },
 ] as const;
 
 export default function Dashboard({
@@ -83,6 +91,7 @@ export default function Dashboard({
   projects,
   receipts,
   expenditures,
+  carryForward,
 }: Props) {
   const [sort, setSort] = useState<{ key: string; dir: 'asc' | 'desc' }>({
     key: 'received',
@@ -173,8 +182,11 @@ export default function Dashboard({
         id: c.id,
         company: c.name,
         received: companyReceived(c.id, receipts),
-        carry: companyCarryForward(c.id, receipts),
+        // Carry forward is DERIVED — the sum of this company's carry-forward rows.
+        // It is a slice of the balance below, never an addition to it.
+        carry: companyCarryForward(c.id, carryForward),
         expenditure: companyExpenditure(c.id, expenditures),
+        // Balance = Received − Expenditure.
         balance: companyBalance(c.id, receipts, expenditures),
         projects: projects.filter(p => p.companyIds.includes(c.id)).length,
       }));
@@ -320,85 +332,43 @@ export default function Dashboard({
           )}
         </Card>
 
-        {/* Company Fund Positions table — tap a header to sort */}
-        <Card style={{ marginTop: 14, paddingHorizontal: 0 }}>
-          <Text style={[styles.cardTitle, { paddingHorizontal: 16 }]}>
-            Company Fund Positions
-          </Text>
-          {posRows.length === 0 ? (
-            <Text style={[styles.empty, { paddingHorizontal: 16 }]}>
-              No companies yet.
-            </Text>
-          ) : (
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={{ paddingHorizontal: 16 }}
-            >
-              <View>
-                <View style={[styles.tRow, styles.tHeadRow]}>
-                  {POS_COLS.map(col => {
-                    const on = sort.key === col.key;
-                    return (
-                      <Pressable
-                        key={col.key}
-                        onPress={() => toggleSort(col.key)}
-                        style={[
-                          styles[col.w],
-                          col.right && { alignItems: 'flex-end' },
-                        ]}
-                      >
-                        <Text
-                          style={[styles.th, on && { color: theme.primary }]}
-                          numberOfLines={1}
-                        >
-                          {col.label}
-                          {on ? (sort.dir === 'asc' ? ' ↑' : ' ↓') : ''}
-                        </Text>
-                      </Pressable>
-                    );
-                  })}
-                </View>
-                {posRows.map(r => (
-                  <View key={r.id} style={styles.tRow}>
-                    <Text
-                      style={[
-                        styles.td,
-                        styles.cCompany,
-                        { fontWeight: '700', color: theme.text },
-                      ]}
-                      numberOfLines={1}
-                    >
-                      {r.company}
-                    </Text>
-                    <Text style={[styles.td, styles.cNum]}>
-                      {inr(r.received)}
-                    </Text>
-                    <Text style={[styles.td, styles.cNum]}>{inr(r.carry)}</Text>
-                    <Text
-                      style={[styles.td, styles.cNum, { color: theme.danger }]}
-                    >
-                      {inr(r.expenditure)}
-                    </Text>
-                    <Text
-                      style={[
-                        styles.td,
-                        styles.cNum,
-                        {
-                          color: r.balance >= 0 ? theme.success : theme.danger,
-                          fontWeight: '800',
-                        },
-                      ]}
-                    >
-                      {inr(r.balance)}
-                    </Text>
-                    <Text style={[styles.td, styles.cProj]}>{r.projects}</Text>
-                  </View>
-                ))}
-              </View>
-            </ScrollView>
-          )}
-        </Card>
+        {/* Company Fund Positions — the shared table, so it matches every other
+            list in the app. Tap a column header to sort by it. */}
+        <View style={styles.tableSection}>
+          <Text style={styles.cardTitle}>Company Fund Positions</Text>
+          <View style={styles.sortRow}>
+            {POS_COLS.map(col => {
+              const on = sort.key === col.key;
+              return (
+                <Pressable
+                  key={col.key}
+                  onPress={() => toggleSort(col.key)}
+                  style={[styles.sortChip, on && styles.sortChipOn]}>
+                  <Text style={[styles.sortChipText, on && styles.sortChipTextOn]}>
+                    {col.label}{on ? (sort.dir === 'asc' ? ' ↑' : ' ↓') : ''}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+          <DataTable
+            rows={posRows}
+            keyFor={r => r.id}
+            empty="No companies yet."
+            pageSize={6}
+            columns={[
+              { label: 'COMPANY', width: 145, render: r => <TCell text={r.company} strong /> },
+              { label: 'RECEIVED', width: 110, right: true, render: r => <TCell text={inr(r.received)} right color={theme.success} /> },
+              { label: 'CARRY FWD', width: 110, right: true, render: r => <TCell text={inr(r.carry)} right /> },
+              { label: 'EXPENDITURE', width: 115, right: true, render: r => <TCell text={inr(r.expenditure)} right color={theme.danger} /> },
+              {
+                label: 'BALANCE', width: 110, right: true,
+                render: r => <TCell text={inr(r.balance)} right strong color={r.balance >= 0 ? theme.success : theme.danger} />,
+              },
+              { label: 'PROJECTS', width: 80, right: true, render: r => <TCell text={String(r.projects)} right /> },
+            ]}
+          />
+        </View>
       </ScrollView>
     </View>
   );
@@ -532,23 +502,14 @@ const styles = StyleSheet.create({
   },
   pieLegendPct: { fontSize: 12.5, color: theme.muted, fontWeight: '700' },
 
-  // Table
-  tRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 11,
-    borderBottomWidth: 1,
-    borderBottomColor: theme.border,
+  // Company Fund Positions block: a title, the sort chips, then the shared table.
+  tableSection: { marginTop: 16, gap: 10 },
+  sortRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
+  sortChip: {
+    paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999,
+    borderWidth: 1, borderColor: theme.border, backgroundColor: '#fff',
   },
-  tHeadRow: { borderBottomWidth: 1.5 },
-  th: {
-    fontSize: 11,
-    color: theme.faint,
-    fontWeight: '700',
-    letterSpacing: 0.3,
-  },
-  td: { fontSize: 12.5, color: theme.muted, fontWeight: '600' },
-  cCompany: { width: 150 },
-  cNum: { width: 110, textAlign: 'right' },
-  cProj: { width: 70, textAlign: 'right' },
+  sortChipOn: { backgroundColor: theme.primarySoft, borderColor: theme.primary },
+  sortChipText: { fontSize: 11, fontWeight: '700', color: theme.muted },
+  sortChipTextOn: { color: theme.primary },
 });
